@@ -1,0 +1,8 @@
+{
+    "params": {
+        "batch_size": 32768,
+        "hidden_layers_1": 2,
+        "hidden_layers_2": 2,
+        "lr": 0.00014753857897785552
+    }
+}
