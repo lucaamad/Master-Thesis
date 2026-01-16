@@ -1,0 +1,11 @@
+{
+    "params": {
+        "batch_size": 16384,
+        "dropout_rate": 0.03594186989245445,
+        "out_channels_1": 32,
+        "out_channels_2": 32,
+        "synthesizer_hidden_dim": 1024,
+        "lr": 0.0008449638281893405,
+        "dim_embedding": 256
+    }
+}
