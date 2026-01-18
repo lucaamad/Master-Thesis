@@ -525,7 +525,7 @@ class evaluation:
                 batch_theta_n = theta_tensor[:current_batch_size_n]
                 f, x_n = simulate_heston_payoff(batch_theta_n[:, 1], batch_theta_n[:, 3], batch_theta_n[:, 4],
                                                 batch_theta_n[:, 5], batch_theta_n[:, 6], batch_theta_n[:, 2], self.T,
-                                                self.dt, int(n))
+                                                self.dt, current_batch_size_n)
                 g = model(batch_theta_n, x_n)
                 sum_diff += torch.sum(f - g)
 
@@ -535,7 +535,7 @@ class evaluation:
                 batch_theta_N = theta_tensor[:current_batch_size_N]
                 _, x_N = simulate_heston_payoff(batch_theta_N[:, 1], batch_theta_N[:, 3], batch_theta_N[:, 4],
                                                 batch_theta_N[:, 5], batch_theta_N[:, 6], batch_theta_N[:, 2], self.T,
-                                                self.dt, int(N))
+                                                self.dt, current_batch_size_N)
                 g_tilda = model(batch_theta_N, x_N)
                 sum_g_tilda += torch.sum(g_tilda)
             
