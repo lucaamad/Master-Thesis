@@ -74,7 +74,7 @@ def load_best_params(filename):
     return params[f"params"]
 
 # -----------------------------Simulations---------------------------------------
-class HJMGridContext:
+class HJMContext:
     """
     Manages the time grids, indices, and pre-calculated tensors for the 
     Heath-Jarrow-Morton (HJM) framework simulation.
@@ -134,7 +134,7 @@ def simulate_hjm_swaption(ctx, sigma0_vec, alpha_sigma_vec, f0_vec, c_f_vec, alp
     Simulates the HJM model to price a Swaption.
     
     Arguments:  
-        ctx: HJMGridContext object.
+        ctx: HJMContext object.
         sigma0_vec, alpha_sigma_vec, f0_vec, c_f_vec, alpha_f_vec: parameters of the base volatility surface and the intitial forward curve.
         n_paths: number of paths to generate.
         C: notional amount.
@@ -272,7 +272,7 @@ class PEMCDataset(IterableDataset):
         self.sim_chunk_size = sim_chunk_size
 
         self.batches_per_epoch = num_samples // batch_size + (num_samples % batch_size > 0)
-        self.ctx = HJMGridContext(0, T, dt_grid, t0, dt_swap, n_p, device)
+        self.ctx = HJMContext(0, T, dt_grid, t0, dt_swap, n_p, device)
 
     def __iter__(self):
         for batch_idx in range(self.batches_per_epoch):
@@ -335,7 +335,7 @@ class ValidationDataset(IterableDataset):
         self.num_samples = num_samples
         self.yield_batch_size = yield_batch_size
         self.n_params = len(intervals)
-        self.ctx = HJMGridContext(0, T, dt_grid, t0, dt_swap, n_p, device)
+        self.ctx = HJMContext(0, T, dt_grid, t0, dt_swap, n_p, device)
 
         # Lists to collect the results from batches
         theta_list = []
@@ -617,7 +617,6 @@ class training:
 
         # Early-stopping variables
         self.best_mare = float('inf')
-        self.loss_at_best_mare = float('inf')
         self.best_model_state = None
 
         # Initialize the training dataset and the DataLoader
@@ -717,7 +716,6 @@ class training:
             # Case of improved modified MARE
             elif val_mare < self.best_mare:
                 self.best_mare = val_mare
-                self.loss_at_best_mare = val_loss
                 self.best_model_state = copy.deepcopy(self.model.state_dict())
                 patience_counter = 0
                 is_improvement = True
@@ -758,7 +756,7 @@ class evaluation:
             dt_grid: temporal discretization step.
         """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.ctx = HJMGridContext(0, T, dt_grid, t0, dt_swap, n_p, self.device)
+        self.ctx = HJMContext(0, T, dt_grid, t0, dt_swap, n_p, self.device)
         self.T, self.C, self.t0 = T, C, t0
         self.dt_swap, self.n_p, self.dt_grid = dt_swap, n_p, dt_grid
 
