@@ -103,9 +103,6 @@ class HJMContext:
         # Number of steps until the option expiry (t_prime_0)
         self.N_time = int(round(t_prime_0 / dt))
 
-        # Used for splitting Brownian motion paths (Midpoint)
-        self.half_idx = self.N_time // 2
-
         # Calculate (T - t) matrix for all points on the grid
         t_col = self.grid_T[:self.N_time].unsqueeze(1)
         T_row = self.grid_T.unsqueeze(0)
