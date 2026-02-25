@@ -643,7 +643,7 @@ class evaluation:
 
 # ----------------------------Optuna optimization--------------------------------
 # Sampling parameters
-Ntrain = 128 * 10 ** 4
+Ntrain = 128 * 10 ** 2
 sampling_freq = 252
 intervals = [(0.01, 0.03), (80, 120), (0.05, 0.25), (90, 110)]  # (r,S0,sigma,K)
 dt = 1 / sampling_freq

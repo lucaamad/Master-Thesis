@@ -15,12 +15,14 @@ from torch.utils.data import IterableDataset, DataLoader
 import gc
 import copy
 
-# ------------------------- Script Settings-------------------------------------
+# -------------------------Script Settings---------------------------------------
 # OPTUNA TUNING
-use_saved_params = True  # Set to True to load saved parameters instead of running Optuna
+use_saved_params_1 = True  # Set to True to load saved parameters instead of running Optuna
+use_saved_params_14 = True  # Set to True to load saved parameters instead of running Optuna
 
 # LOAD MODEL
-load_model = True  # Set to True to load directly the retrained model instead of running the retraining
+load_model_1 = True  # Set to True to load directly the retrained model for dim(X)=1 instead of running the retraining
+load_model_14 = True  # Set to True to load directly the retrained model for dim(X)=14 instead of running the retraining
 
 # GROUND TRUTH COMPUTATION
 compute_ground_truth = False  # Set to False to load saved ground truth value instead of computing it
@@ -28,9 +30,11 @@ compute_ground_truth = False  # Set to False to load saved ground truth value in
 torch.set_default_dtype(torch.float64)
 
 BASE_DIR = os.getcwd()
-GT_FILE = os.path.join(BASE_DIR, "Boost_PEMC_ground_truth.json")
-PARAMS_FILE = os.path.join(BASE_DIR, "Boost_PEMC_best_params.json")
-MODEL_FILE = os.path.join(BASE_DIR, "Boost_PEMC_trained_model.pth")
+GT_FILE = os.path.join(BASE_DIR, "PEMC_ground_truth.json")
+PARAMS_FILE_1 = os.path.join(BASE_DIR, "PEMC_1_best_params.json")
+PARAMS_FILE_14 = os.path.join(BASE_DIR, "PEMC_14_best_params.json")
+MODEL_FILE_1 = os.path.join(BASE_DIR, "PEMC_1_trained_model.pth")
+MODEL_FILE_14 = os.path.join(BASE_DIR, "PEMC_14_trained_model.pth")
 
 # ---------------------------Seed Settings---------------------------------------
 def set_all_seeds(seed=42):
@@ -92,7 +96,6 @@ def simulate_X(N, W_dt, dim_X, device):
 
     return X
 
-
 def simulate_arithmetic_asian_option_payoff(N, sampling_freq, dt, W_dt, theta, device):
     """
     Simulates the payoff of an arithmetic Asian call option.
@@ -122,7 +125,6 @@ def simulate_arithmetic_asian_option_payoff(N, sampling_freq, dt, W_dt, theta, d
 
     return payoff
 
-
 def simulate_geometric_asian_option_payoff(N, sampling_freq, dt, W_dt, theta, device):
     '''
     Simulates the payoff of a geometric Asian call option.
@@ -148,10 +150,9 @@ def simulate_geometric_asian_option_payoff(N, sampling_freq, dt, W_dt, theta, de
 
     return payoff
 
-
 def geometric_asian_option_closed_form_expected_payoff(r, S0, sigma, K, T, n):
     """
-    Computes the closed-form price for a geometric Asian call option.
+    Computes the closed-form expected payoff of a geometric Asian call option with discrete monitoring under the B&S model.
 
     Arguments:
         r: risk-free rate.
@@ -162,7 +163,7 @@ def geometric_asian_option_closed_form_expected_payoff(r, S0, sigma, K, T, n):
         n: sampling frequency.
     """
     sigma_n = sigma * np.sqrt((2 * n + 1) * (n + 1) / (6 * n ** 2))
-    mu_n = (r - sigma ** 2 / 2) * (n + 1) / (2 * n) + 0.5 * sigma_n ** 2
+    mu_n = (r - sigma ** 2 / 2) * (n + 1)/ (2 * n) + 0.5 * sigma_n **2
     d1 = (np.log(S0 / K) + (mu_n + sigma_n ** 2 / 2) * T) / (sigma_n * np.sqrt(T))
     d2 = d1 - sigma_n * np.sqrt(T)
     expected_payoff = (S0 * np.exp(mu_n * T) * stats.norm.cdf(d1) - K * stats.norm.cdf(d2))
@@ -181,6 +182,7 @@ def scale_theta(theta_tensor, intervals):
     for i, (low, high) in enumerate(intervals):
         theta_scaled[:, i] = (theta_tensor[:, i] - low) / (high - low)
     return theta_scaled
+
 
 def scale_X(X, dt, sampling_freq, dim_X):
     """
@@ -225,9 +227,9 @@ class PEMCDataset(IterableDataset):
         self.batch_size = batch_size
         self.batches_per_epoch = self.num_samples // self.batch_size + (self.num_samples % self.batch_size > 0)
 
-
     def __iter__(self):
         for batch_idx in range(self.batches_per_epoch):
+
             # Computation of the batch size in order to manage the last batch, that could be smaller than the previous ones
             current_batch_size = int(min(self.batch_size, self.num_samples - batch_idx * self.batch_size))
 
@@ -238,16 +240,14 @@ class PEMCDataset(IterableDataset):
 
             W_dt = torch.normal(0.0, float(np.sqrt(self.dt)), size=(current_batch_size, self.sampling_freq), device=self.device)
 
-            payoff_aritm = simulate_arithmetic_asian_option_payoff(current_batch_size, self.sampling_freq, self.dt, W_dt, theta, self.device)
-            payoff_geom = simulate_geometric_asian_option_payoff(current_batch_size, self.sampling_freq, self.dt, W_dt, theta, self.device)
+            payoff = simulate_arithmetic_asian_option_payoff(current_batch_size, self.sampling_freq, self.dt, W_dt, theta, self.device)
             X = simulate_X(current_batch_size, W_dt, self.dim_X, self.device)
-            label = payoff_aritm - payoff_geom
 
             # Scale theta and X
             theta_scaled = scale_theta(theta, self.intervals)
             X_scaled = scale_X(X, self.dt, self.sampling_freq, self.dim_X)
 
-            yield theta_scaled, X_scaled, label
+            yield theta_scaled, X_scaled, payoff
 
 class ValidationDataset(IterableDataset):
     """
@@ -274,18 +274,16 @@ class ValidationDataset(IterableDataset):
         W_dt = torch.normal(0.0, float(np.sqrt(dt)), size=(num_samples, sampling_freq), device=device)
 
         # Generate all payoffs and X
-        payoff_aritm = simulate_arithmetic_asian_option_payoff(num_samples, sampling_freq, dt, W_dt, theta, device)
-        payoff_geom = simulate_geometric_asian_option_payoff(num_samples, sampling_freq, dt, W_dt, theta, device)
+        self.payoff = simulate_arithmetic_asian_option_payoff(num_samples, sampling_freq, dt, W_dt, theta, device)
         X = simulate_X(num_samples, W_dt, dim_X, device)
-        self.label = payoff_aritm - payoff_geom
 
         # Scale theta and X
         self.theta_scaled = scale_theta(theta, intervals)
         self.X_scaled = scale_X(X, dt, sampling_freq, dim_X)
 
     def __iter__(self):
-        yield self.theta_scaled, self.X_scaled, self.label
-
+        yield self.theta_scaled, self.X_scaled, self.payoff
+        
 # --------------------------------Model------------------------------------------
 class PEMCNetwork(nn.Module):
     """
@@ -386,7 +384,7 @@ class PEMCNetwork(nn.Module):
             # Initialize all bias values to zero
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-# -------------------------Training-----------------------------------------------
+# -------------------------Training------------------------------------------------
 class training:
     """
     Trains the model.
@@ -402,7 +400,7 @@ class training:
             dt: temporal discretization step.
             dim_X: dimension of X.
             lr: learning rate.
-        """      
+        """        
         # Use GPU, if available, otherwise use CPU
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
@@ -430,7 +428,7 @@ class training:
 
     def validate(self, val_loader):
         """
-        Compute MSE and modified MARE on the validation dataset.
+        Computes MSE and modified MARE on the validation dataset.
         
         Arguments:
             val_loader: DataLoader for the validation set.
@@ -475,7 +473,7 @@ class training:
 
             for theta, x, y in self.train_loader:
 
-                # Create a batch of the dataset and train the model on it                
+                # Create a batch of the dataset and train the model on it
                 self.optimizer.zero_grad()
                 output = self.model(theta, x)
                 loss = self.criterion(output, y)
@@ -504,7 +502,6 @@ class training:
                 self.best_model_state = copy.deepcopy(self.model.state_dict())
                 patience_counter = 0
                 is_improvement = True
-
             # Case of not improved modified MARE
             else:
                 patience_counter += 1
@@ -528,7 +525,7 @@ class training:
 # -------------------------Evaluation----------------------------------------------
 class evaluation:
     """
-    Computes the MC, CV and Boost PEMC estimators.
+    Computes the MC, CV and PEMC estimators.
     """
     def __init__(self, dt, sampling_freq, dim_X, intervals):
         """
@@ -559,13 +556,10 @@ class evaluation:
 
         with torch.no_grad():
             for i in range(num_batches):
-
                 # Accumulate the sum of payoffs for each batch
                 current_size = int(min(batch_size, n - i * batch_size))
-                W_dt = torch.normal(0.0, float(np.sqrt(self.dt)), size=(current_size, self.sampling_freq),
-                                    device=self.device)
-                payoff = simulate_arithmetic_asian_option_payoff(current_size, self.sampling_freq, self.dt, W_dt,
-                                                                 theta_tensor[:int(current_size)], self.device)
+                W_dt = torch.normal(0.0, float(np.sqrt(self.dt)), size=(current_size, self.sampling_freq), device=self.device)
+                payoff = simulate_arithmetic_asian_option_payoff(current_size, self.sampling_freq, self.dt, W_dt, theta_tensor[:int(current_size)], self.device)
                 sum_payoffs += torch.sum(payoff)
         return (sum_payoffs / n).item()
 
@@ -579,24 +573,19 @@ class evaluation:
         """
         W_dt = torch.normal(0.0, float(np.sqrt(self.dt)), size=(int(n), self.sampling_freq), device=self.device)
         theta_tensor = torch.tensor(theta, device=self.device).repeat(int(n), 1)
-        payoff_aritm = simulate_arithmetic_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor,
-                                                               self.device)
-        payoff_geom = simulate_geometric_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor,
-                                                             self.device)
-        expected_payoff_exact = geometric_asian_option_closed_form_expected_payoff(theta[0], theta[1], theta[2],
-                                                                                   theta[3],
-                                                                                   self.dt * self.sampling_freq,
-                                                                                   self.sampling_freq)
+        payoff_aritm = simulate_arithmetic_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor, self.device)
+        payoff_geom = simulate_geometric_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor, self.device)
+        expected_payoff_exact = geometric_asian_option_closed_form_expected_payoff(theta[0], theta[1], theta[2], theta[3], self.dt * self.sampling_freq, self.sampling_freq)
         cv = torch.mean(payoff_aritm - payoff_geom).item() + expected_payoff_exact
 
         return cv
 
-    def evaluate_Boost_PEMC(self, model, N, n, theta):
+    def evaluate_PEMC(self, model, N, n, theta):
         """
-        Computes the Boost PEMC estimator.
+        Computes the PEMC estimator.
 
         Arguments:
-            model: "PEMCNetwork" object that represents the model used to compute the Boost PEMC estimator.
+            model: "PEMCNetwork" object that represents the model used to compute the PEMC estimator.
             N: N=10n.
             n: sample size.
             theta: vector of the evaluation parameters.
@@ -604,10 +593,7 @@ class evaluation:
         # Generate n paired samples (label, features)
         theta_tensor = torch.tensor(theta, device=self.device).repeat(int(n), 1)
         W_dt = torch.normal(0.0, float(np.sqrt(self.dt)), size=(int(n), self.sampling_freq), device=self.device)
-        f = simulate_arithmetic_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor,
-                                                    self.device)
-        payoff_geom = simulate_geometric_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor,
-                                                             self.device)
+        f = simulate_arithmetic_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor, self.device)
         X = simulate_X(int(n), W_dt, self.dim_X, self.device)
 
         # Scale theta and X
@@ -623,11 +609,6 @@ class evaluation:
         theta_tilda_scaled = scale_theta(theta_tensor_tilda, self.intervals)
         X_tilda_scaled = scale_X(X_tilda, self.dt, self.sampling_freq, self.dim_X)
 
-        expected_payoff_exact = geometric_asian_option_closed_form_expected_payoff(theta[0], theta[1], theta[2],
-                                                                                   theta[3],
-                                                                                   self.sampling_freq * self.dt,
-                                                                                   self.sampling_freq)
-
         # Set the model to evaluation mode
         model.eval()
 
@@ -635,22 +616,24 @@ class evaluation:
         with torch.no_grad():
             g = model(theta_scaled, X_scaled)
             g_tilda = model(theta_tilda_scaled, X_tilda_scaled)
-            
-        # Compute Boost PEMC estimator
-        Boost_PEMC = torch.mean(f - payoff_geom - g) + torch.mean(g_tilda) + expected_payoff_exact
 
-        return Boost_PEMC.item()
+        # Compute PEMC estimator
+        PEMC = torch.mean(f - g) + torch.mean(g_tilda)
 
-# ----------------------------Optuna optimization--------------------------------
+        return PEMC.item()
+
+# ----------------------------Optuna Optimization--------------------------------
 # Sampling parameters
-Ntrain = 128 * 10 ** 4
+Ntrain = 128
 sampling_freq = 252
-intervals = [(0.01, 0.03), (80, 120), (0.05, 0.25), (90, 110)]  # (r,S0,sigma,K)
+intervals = [(0.01, 0.03), (80, 120), (0.05, 0.25), (90, 110)] #(r,S0,sigma,K)
 dt = 1 / sampling_freq
 
 # Optuna parameters
-epochs = 200
-patience = 20
+grid_search_epochs_1 = 150
+grid_search_epochs_14 = 200
+grid_search_patience_1 = 15
+grid_search_patience_14 = 20
 n_trials = 100
 
 # Get device
@@ -672,9 +655,13 @@ def run_optuna_study(dim_X):
         model = None
         trainer = None
         try:
-            batch_size = trial.suggest_categorical('batch_size', [256, 512, 1024, 2048, 4096])
+            batch_size = trial.suggest_categorical('batch_size', [8, 16, 32, 64, 128])
             theta_hidden = trial.suggest_int('theta_hidden', 16, 256)
             combined_hidden = trial.suggest_int('combined_hidden', 16, 256)
+
+            epochs = grid_search_epochs_14 if dim_X == 14 else grid_search_epochs_1
+            patience = grid_search_patience_14 if dim_X == 14 else grid_search_patience_1
+            early_stopping_loader = early_stopping_loader_14 if dim_X == 14 else early_stopping_loader_1
 
             # Create the model
             model = PEMCNetwork(x_dim=dim_X, theta_hidden=theta_hidden, combined_hidden=combined_hidden)
@@ -702,59 +689,117 @@ def run_optuna_study(dim_X):
     study.optimize(objective, n_trials=n_trials)
     return study.best_params
 
-# Skip training and load directly the best model
-if load_model:
-    print(f"Skipping training and loading model from {MODEL_FILE}...")
+# Skip training and load directly the best model for dim(X)=1
+if load_model_1:
+    print(f"Skipping training and loading model from {MODEL_FILE_1}...")
 
-    if not os.path.exists(MODEL_FILE):
-        raise FileNotFoundError(f"Model file {MODEL_FILE} not found, run training first!")
+    if not os.path.exists(MODEL_FILE_1):
+        raise FileNotFoundError(f"Model file {MODEL_FILE_1} not found, run training first!")
 
-    # Load the best hyperparameters
-    best_params = load_best_params(1, PARAMS_FILE)
+    # Load the best hyperparameters for dim(X)=1
+    best_params_1 = load_best_params(1, PARAMS_FILE_1)
 
     # Create the model architecture
-    model = PEMCNetwork(x_dim=1, theta_hidden=best_params['theta_hidden'], combined_hidden=best_params['combined_hidden'])
-    model = model.to(device).double()
+    model_1 = PEMCNetwork(x_dim=1, theta_hidden=best_params_1['theta_hidden'],
+                          combined_hidden=best_params_1['combined_hidden'])
 
-    # Upload weights and biases
-    state_dict = torch.load(MODEL_FILE, map_location=device)
-    model.load_state_dict(state_dict)
+    model_1 = model_1.to(device).double()
+
+    # Upload weights and biases for dim(X)=1
+    state_dict = torch.load(MODEL_FILE_1, map_location=device)
+    model_1.load_state_dict(state_dict)
 
     print("Model loaded successfully")
 
-# Train the model
+# Train the model for dim(X)=1
 else:
-    # Initialize the validation set for early-stopping
-    early_stopping_val_set = ValidationDataset(val_dim, sampling_freq, intervals, dt, 1, device)
-    early_stopping_loader = DataLoader(early_stopping_val_set, batch_size=None)
+    # Initialize the validation set for early-stopping for dim(X)=1
+    early_stopping_val_set_1 = ValidationDataset(val_dim, sampling_freq, intervals, dt, 1, device)
+    early_stopping_loader_1 = DataLoader(early_stopping_val_set_1, batch_size=None)
 
-    # Load the best hyperparameters and just do the final retraining
-    if use_saved_params:
+    # Load the best hyperparameters for dim(X)=1 and just do the final retraining
+    if use_saved_params_1:
         print(f"Loading hyperparameters from input...")
-        best_params = load_best_params(1, PARAMS_FILE)
+        best_params_1 = load_best_params(1, PARAMS_FILE_1)
 
-    # Run Optuna hyperparameter tuning
+    # Run Optuna hyperparameter tuning for dim(X)=1
     else:
-        print("Starting Optuna study...")
-        best_params = run_optuna_study(1)
-        save_best_params(best_params, 1, PARAMS_FILE)
+        print("Starting Optuna study for dim_X=1...")
+        best_params_1 = run_optuna_study(1)
+        save_best_params(best_params_1, 1, PARAMS_FILE_1)
 
-    # Retrain with best hyperparameters
-    print("Retraining with best hyperparameters...")
-    model = PEMCNetwork(x_dim=1, theta_hidden=best_params['theta_hidden'],
-                          combined_hidden=best_params['combined_hidden'])
-    trainer = training(model, Ntrain, best_params['batch_size'], sampling_freq, intervals, dt, 1, lr=1e-3)
-    trainer.fit(num_epochs=epochs, patience=patience, val_loader=early_stopping_loader)
+    # Retrain with best hyperparameters for dim(X)=1
+    print("Retraining with best hyperparameters for dim_X=1...")
+    model_1 = PEMCNetwork(x_dim=1, theta_hidden=best_params_1['theta_hidden'],
+                          combined_hidden=best_params_1['combined_hidden'])
+    trainer_1 = training(model_1, Ntrain, best_params_1['batch_size'], sampling_freq, intervals, dt, 1, lr=1e-3)
+    trainer_1.fit(num_epochs=grid_search_epochs_1, patience=grid_search_patience_1, val_loader=early_stopping_loader_1)
 
-    print(f"Saving trained model to {MODEL_FILE}...")
-    torch.save(model.state_dict(), MODEL_FILE)
+    print(f"Saving trained model to {MODEL_FILE_1}...")
+    torch.save(model_1.state_dict(), MODEL_FILE_1)
     print("Model saved successfully")
 
     # Clean memory
-    del early_stopping_val_set, early_stopping_loader
-    del trainer.train_dataset
-    del trainer.train_loader
-    del trainer.optimizer
+    del early_stopping_val_set_1, early_stopping_loader_1
+    del trainer_1.train_dataset
+    del trainer_1.train_loader
+    del trainer_1.optimizer
+
+# Skip training and load directly the best model for dim(X)=14
+if load_model_14:
+    print(f"Skipping training and loading model from {MODEL_FILE_14}...")
+
+    if not os.path.exists(MODEL_FILE_14):
+        raise FileNotFoundError(f"Model file {MODEL_FILE_14} not found, run training first!")
+
+    # Load the best hyperparameters for dim(X)=14
+    best_params_14 = load_best_params(14, PARAMS_FILE_14)
+
+    # Create the model architecture
+    model_14 = PEMCNetwork(x_dim=14, theta_hidden=best_params_14['theta_hidden'],
+                          combined_hidden=best_params_14['combined_hidden'])
+
+    model_14 = model_14.to(device).double()
+
+    # Upload weights and biases for dim(X)=14
+    state_dict = torch.load(MODEL_FILE_14, map_location=device)
+    model_14.load_state_dict(state_dict)
+
+    print("Model loaded successfully")
+
+# Train the model for dim(X)=14
+else:
+    # Initialize the validation set for early-stopping for dim(X)=14
+    early_stopping_val_set_14 = ValidationDataset(val_dim, sampling_freq, intervals, dt, 14, device)
+    early_stopping_loader_14 = DataLoader(early_stopping_val_set_14, batch_size=None)
+
+    # Load the best hyperparameters for dim(X)=14 and just do the final retraining
+    if use_saved_params_14:
+        print(f"Loading hyperparameters from input...")
+        best_params_14 = load_best_params(14, PARAMS_FILE_14)
+
+    # Run Optuna hyperparameter tuning for dim(X)=14
+    else:
+        print("Starting Optuna study for dim_X=14...")
+        best_params_14 = run_optuna_study(14)
+        save_best_params(best_params_14, 14, PARAMS_FILE_14)
+
+    # Retrain with best hyperparameters for dim(X)=14
+    print("Retraining with best hyperparameters for dim_X=14...")
+    model_14 = PEMCNetwork(x_dim=14, theta_hidden=best_params_14['theta_hidden'],
+                          combined_hidden=best_params_14['combined_hidden'])
+    trainer_14 = training(model_14, Ntrain, best_params_14['batch_size'], sampling_freq, intervals, dt, 14, lr=1e-3)
+    trainer_14.fit(num_epochs=grid_search_epochs_14, patience=grid_search_patience_14, val_loader=early_stopping_loader_14)
+
+    print(f"Saving trained model to {MODEL_FILE_14}...")
+    torch.save(model_14.state_dict(), MODEL_FILE_14)
+    print("Model saved successfully")
+
+    # Clean memory
+    del early_stopping_val_set_14, early_stopping_loader_14
+    del trainer_14.train_dataset
+    del trainer_14.train_loader
+    del trainer_14.optimizer
 
 # --------------------------Metrics Evaluation-----------------------------------
 # Delete datasets to free memory
@@ -766,19 +811,20 @@ torch.cuda.empty_cache()
 # Evaluation parameters
 num_runs = 300
 n_values = [1000, 4000, 9000]
-theta_eval = [0.02, 100, 0.2, 100]  # (r,S0,sigma,K)
-batch_eval = 2048 * 1000
+theta_eval = [0.02, 100, 0.2, 100] #(r,S0,sigma,K)
+batch_eval = 2048*1000
 
 # Set the seed for evaluation
 set_all_seeds(42)
 
-evaluator = evaluation(dt, sampling_freq, 1, intervals)
+evaluator_1 = evaluation(dt, sampling_freq, 1, intervals)
+evaluator_14 = evaluation(dt, sampling_freq, 14, intervals)
 theta_tensor = torch.tensor(theta_eval, device=device).repeat(batch_eval, 1)
 
 # Compute ground truth
 if compute_ground_truth:
     print("Computing ground truth...")
-    ground_truth = evaluator.evaluate_MC(int(2e9), theta_tensor, batch_eval)
+    ground_truth = evaluator_1.evaluate_MC(int(2e9), theta_tensor, batch_eval)
     data_to_save = {"ground_truth": ground_truth}
     os.makedirs(os.path.dirname(GT_FILE), exist_ok=True)
     with open(GT_FILE, 'w') as f:
@@ -798,46 +844,56 @@ else:
 print(f"Ground_truth:{ground_truth}")
 
 # Initialize arrays to store RMSE for each n
+rmseMC = np.zeros(len(n_values))
 rmseCV = np.zeros(len(n_values))
-rmseBoost_PEMC_1 = np.zeros(len(n_values))
+rmsePEMC_1 = np.zeros(len(n_values))
+rmsePEMC_14 = np.zeros(len(n_values))
 
 for i, n in enumerate(n_values):
     print(f"Evaluation with n={n}")
-
-    # Reset error accumulators for each n
+    errMC = 0
     errCV = 0
-    errBoost_PEMC_1 = 0
+    errPEMC_1 = 0
+    errPEMC_14 = 0
 
     for j in range(num_runs):
         current_seed = 42 + (i * 10000) + j
         set_all_seeds(current_seed)
-        CV = evaluator.evaluate_CV(n, theta_eval)
-        Boost_PEMC_1 = evaluator.evaluate_Boost_PEMC(model, 10 * n, n, theta_eval)
+        CV = evaluator_1.evaluate_CV(n, theta_eval)
+        PEMC_1 = evaluator_1.evaluate_PEMC(model_1, 10 * n, n, theta_eval)
+        MC = evaluator_1.evaluate_MC(n, theta_tensor, batch_eval)
+        PEMC_14 = evaluator_14.evaluate_PEMC(model_14, 10 * n, n, theta_eval)
 
+        errMC += (MC - ground_truth) ** 2
         errCV += (CV - ground_truth) ** 2
-        errBoost_PEMC_1 += (Boost_PEMC_1 - ground_truth) ** 2
+        errPEMC_1 += (PEMC_1 - ground_truth) ** 2
+        errPEMC_14 += (PEMC_14 - ground_truth) ** 2
 
     # Compute RMSE for current n
+    rmseMC[i] = np.sqrt(errMC / num_runs)
     rmseCV[i] = np.sqrt(errCV / num_runs)
-    rmseBoost_PEMC_1[i] = np.sqrt(errBoost_PEMC_1 / num_runs)
+    rmsePEMC_1[i] = np.sqrt(errPEMC_1 / num_runs)
+    rmsePEMC_14[i] = np.sqrt(errPEMC_14 / num_runs)
 
 # Create a dataframe with the RMSE values for each estimator and value of n
 errors = pd.DataFrame(
-    data=[rmseBoost_PEMC_1, rmseCV],
+    data=[rmseMC, rmsePEMC_1, rmsePEMC_14, rmseCV],
     columns=[f'n={n}' for n in n_values],
-    index=['Boost PEMC (dim(X) = 1)', 'Geometric CV']
+    index=['Monte Carlo (MC)', 'PEMC (dim(X) = 1)', 'PEMC (dim(X) = 14)', 'Geometric CV']
 )
 print(errors)
 
-# Compute the percentage reduction of Boost PEMC with respect to MC
-Boost_PEMC_1_reduction = np.zeros(len(n_values))
+# Compute the percentage reduction of PEMC with respect to MC
+PEMC_1_reduction = np.zeros(len(n_values))
+PEMC_14_reduction = np.zeros(len(n_values))
 for i, n in enumerate(n_values):
-  Boost_PEMC_1_reduction[i] = (errors[f'n={n}']['Geometric CV'] - errors[f'n={n}']['Boost PEMC (dim(X) = 1)']) / errors[f'n={n}']['Geometric CV']
+  PEMC_1_reduction[i] = (errors[f'n={n}']['Monte Carlo (MC)'] - errors[f'n={n}']['PEMC (dim(X) = 1)']) / errors[f'n={n}']['Monte Carlo (MC)']
+  PEMC_14_reduction[i] = (errors[f'n={n}']['Monte Carlo (MC)'] - errors[f'n={n}']['PEMC (dim(X) = 14)']) / errors[f'n={n}']['Monte Carlo (MC)']
 
-# Create a datafame with the percentage reduction of Boost PEMC with respect to MC
+# Create a datafame with the percentage reduction of PEMC with respect to MC
 reductions = pd.DataFrame(
-    data=[Boost_PEMC_1_reduction],
+    data=[PEMC_1_reduction, PEMC_14_reduction],
     columns=[f'n={n}' for n in n_values],
-    index=['Boost PEMC (dim(X) = 1)']
+    index=['PEMC (dim(X) = 1)', 'PEMC (dim(X) = 14)']
 )
 print(reductions.map(lambda x: f"{x:.3%}"))

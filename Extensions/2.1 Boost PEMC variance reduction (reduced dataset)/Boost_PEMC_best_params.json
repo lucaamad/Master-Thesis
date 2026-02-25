@@ -1,0 +1,7 @@
+{
+    "dim_X_1": {
+        "batch_size": 256,
+        "theta_hidden": 137,
+        "combined_hidden": 98
+    }
+}

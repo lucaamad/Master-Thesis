@@ -72,27 +72,6 @@ def load_best_params(dim_X, filename):
     return params[f"dim_X_{dim_X}"]
 
 # -----------------------------Simulations---------------------------------------
-def simulate_X(N, W_dt, dim_X, device):
-    """
-    Simulates the stochastic component X.
-
-    Arguments:
-        N: number of paths to be simulated.
-        W_dt: 2D tensor of Brownian increments.
-        dim_X: dimension of X.
-        device: device where the data is stored (CPU/GPU).
-    """
-    # Compute the number of consecutive Brownian increments to sum to obtain a component of X
-    increments_partition_size = W_dt.shape[1] // dim_X
-
-    # Compute X as the sum of "increments_partition_size" consecutive increments
-    X = torch.zeros((N, dim_X), device=device)
-    for i in range(dim_X):
-        X[:, i] = torch.sum(W_dt[:, i * increments_partition_size:(i + 1) * increments_partition_size], dim=1)
-
-    return X
-
-
 def simulate_arithmetic_asian_option_payoff(N, sampling_freq, dt, W_dt, theta, device):
     """
     Simulates the payoff of an arithmetic Asian call option.
@@ -133,7 +112,7 @@ def simulate_geometric_asian_option_payoff(N, sampling_freq, dt, W_dt, theta, de
         dt: time discretization step.
         W_dt: 2D tensor of Brownian increments.
         theta: vector of parameters.
-        device: device where the data is stored (CPU/GPU).    
+        device: device where the data is stored (CPU/GPU).
     '''
     # Simulate the tensor of log-returns according to GBM
     log_returns = torch.zeros((N, sampling_freq + 1), device=device)
@@ -151,7 +130,7 @@ def simulate_geometric_asian_option_payoff(N, sampling_freq, dt, W_dt, theta, de
 
 def geometric_asian_option_closed_form_expected_payoff(r, S0, sigma, K, T, n):
     """
-    Computes the closed-form price for a geometric Asian call option.
+    Computes the closed-form expected payoff of a geometric Asian call option with discrete monitoring under the B&S model.
 
     Arguments:
         r: risk-free rate.
@@ -169,50 +148,228 @@ def geometric_asian_option_closed_form_expected_payoff(r, S0, sigma, K, T, n):
 
     return expected_payoff
 
-def scale_theta(theta_tensor, intervals):
+# ------------------------------Preprocessing-----------------------------------
+class DiffPCA:
     """
-    Scales theta with min-max scaling.
+    Applies the "split" data transformation step of the Differential PEMC.
+    """
+    def __init__(self, n_components_pca=1-1e-10, n_components_diff_pca=1-1e-4, device='cuda'):
+        """
+        Arguments:
+            n_components_pca: number of desired PCA components (if >=1) or minimum percentage level of 'variance' (squared magnitude) explained by the desired PCA components (if <1).
+            n_components_diff_pca: number of desired differential PCA components (if >=1) or minimum percentage level of 'variance' (squared magnitude) explained by the desired differential PCA components (if <1).
+            device: device where the data is stored (CPU/GPU).
+        """        
+        
+        self.n_components_pca = n_components_pca
+        self.n_components_diff_pca = n_components_diff_pca
+        self.device = device
+        
+        self.y_mean = None
+        self.y_std = None
+        self.mu_theta = None
+        
+        self.P2_theta = None       
+        self.D2_inv_theta = None   
+        self.P3_theta = None      
+        self.n_pca_theta = None
+        self.n_diff_theta = None
+
+        self.P2_w = None
+        self.D2_inv_w = None
+        self.P3_w = None
+        self.n_pca_W = None
+        self.n_diff_W = None
+
+    def compute_diffPCA(self, X, Z):
+        """
+        Applies PCA and differential PCA to the input data. 
+
+        Arguments:
+            X: centered input matrix.
+            Z: scaled gradients matrix.
+        """
+        n_samples, n_features = X.shape
+        
+        # PCA
+        # Perform eigenvalue decomposition of X^T * X / m 
+        Cov_X = (X.T @ X) / n_samples
+        d2, P2 = torch.linalg.eigh(Cov_X)
+        
+        # Order descending
+        d2 = torch.flip(d2, dims=[0])
+        P2 = torch.flip(P2, dims=[1])
+        
+        # Compute the number of components to keep
+        sumd2 = torch.cumsum(d2, dim=0)
+        total_variance_d2 = sumd2[-1]
+
+        if self.n_components_pca is not None:
+            if self.n_components_pca >= 1:
+                n_comp_pca = int(self.n_components_pca)
+            else:
+                sumd2_ratio = sumd2 / total_variance_d2
+                target_val = torch.tensor(self.n_components_pca, device=d2.device)
+                n_comp_pca = torch.searchsorted(sumd2_ratio, target_val).item() + 1
+        else:
+            n_comp_pca = min(n_samples, n_features)
+        
+        d2 = d2[:n_comp_pca]
+        P2 = P2[:, :n_comp_pca]
+        
+        # Compute scaling matrices 
+        d2_inv_sqrt = torch.diag(1.0 / torch.sqrt(d2))
+        d2_sqrt = torch.diag(torch.sqrt(d2))
+        
+        # Update differentials
+        Z2 = (Z @ P2) @ d2_sqrt
+        
+        # Differential PCA
+        # Perform eigenvalue decomposition of X_bar_2^T * X_bar_2 / m       
+        Cov_Z = (Z2.T @ Z2) / n_samples
+        d3, P3 = torch.linalg.eigh(Cov_Z)
+        
+        d3 = torch.flip(d3, dims=[0])
+        P3 = torch.flip(P3, dims=[1])
+        
+        # Compute the number of components to keep
+        sumd3 = torch.cumsum(d3, dim=0)
+        total_variance_d3 = sumd3[-1]
+
+        if self.n_components_diff_pca is not None:
+            if self.n_components_diff_pca >= 1:
+                n_comp_diff = int(self.n_components_diff_pca)
+            else:
+                sumd3_ratio = sumd3 / total_variance_d3
+                target_val = torch.tensor(self.n_components_diff_pca, device=d3.device)
+                n_comp_diff = torch.searchsorted(sumd3_ratio, target_val).item() + 1
+        else:
+            n_comp_diff = min(n_samples, n_features)
+        
+        P3 = P3[:, :n_comp_diff]
+        
+        return P2, d2_inv_sqrt, P3, n_comp_pca, n_comp_diff
+
+    def fit(self, theta, W, y, grads_theta, grads_W, intervals=None):
+        """
+        Fits the transformation matrices and the scaling tensors.
+
+        Arguments:
+            theta: theta parameter.
+            W: Brownian motion increments.
+            y: label.
+            grads_theta: gradients of the label with respect to theta. 
+            grads_W: gradients of the label with respect to W.
+            intervals: sampling intervals of the components of theta.
+        """
+        # Center the inputs
+        if intervals is not None:
+            low = torch.tensor([i[0] for i in intervals], device=self.device)
+            high = torch.tensor([i[1] for i in intervals], device=self.device)
+            self.mu_theta = (low + high) / 2.0
+        else:
+            self.mu_theta = theta.mean(dim=0)
+            
+        X1_theta = theta - self.mu_theta
+        X1_w = W 
+        
+        self.y_mean = y.mean()
+        self.y_std = y.std()
+        
+        # Scale gradients 
+        Z1_theta = grads_theta / self.y_std
+        Z1_w = grads_W / self.y_std
+        
+        # Apply PCA and differential PCA to theta
+        self.P2_theta, self.D2_inv_theta, self.P3_theta, self.n_pca_theta, self.n_diff_theta = self.compute_diffPCA(X1_theta, Z1_theta)
+        
+        # Apply PCA and differential PCA to W
+        self.P2_w, self.D2_inv_w, self.P3_w, self.n_pca_W, self.n_diff_W = self.compute_diffPCA(X1_w, Z1_w)
+        
+        print(f"Theta: dim: {theta.shape[1]} -> PCA: {self.n_pca_theta} -> DiffPCA: {self.n_diff_theta}")
+        print(f"\nX: dim: {W.shape[1]} -> PCA: {self.n_pca_W} -> DiffPCA: {self.n_diff_W}")
+
+    def transform(self, theta, W, y=None):
+        """
+        Transforms the inputs and the label using the fitted tensors.
+
+        Arguments:
+            theta: theta parameter.
+            W: Brownian motion increments.
+            y: label.
+        """
+        # Theta pipeline
+        t_1 = theta - self.mu_theta
+
+        t_2 = (t_1 @ self.P2_theta) @ self.D2_inv_theta
+
+        t_3 = t_2 @ self.P3_theta
+        
+        # W pipeline
+        w_2 = (W @ self.P2_w) @ self.D2_inv_w
+        w_3 = w_2 @ self.P3_w
+        
+        if y is None:
+            return t_3, w_3
+        else:
+            # Return normalized label
+            return t_3, w_3, (y - self.y_mean) / self.y_std
+
+def setup_global_pca(N_calibration, sampling_freq, intervals, dt, device):
+    """
+    Fits the transformation matrices and the scaling tensors once for all.
 
     Arguments:
-        theta_tensor: tensor to scale.
-        intervals: sampling intervals of the parameters of the vector to scale.
-    """
-    theta_scaled = torch.zeros_like(theta_tensor)
-    for i, (low, high) in enumerate(intervals):
-        theta_scaled[:, i] = (theta_tensor[:, i] - low) / (high - low)
-    return theta_scaled
-
-def scale_X(X, dt, sampling_freq, dim_X):
-    """
-    Scales X with standard scaling.
-
-    Arguments:
-        X: tensor to scale.
-        dt: time discretization step.
+        N_calibration: total number of training samples.
         sampling_freq: sampling frequency.
-        dim_X: dimension of X.
+        intervals: intervals used for uniform sampling of theta.
+        dt: time discretization step.
+        device: device where the data is stored (CPU/GPU).
     """
-    increments_partition_size = sampling_freq // dim_X
-    variance = increments_partition_size * dt
-    std_X = np.sqrt(variance)
+    
+    print("Initializing Global PCA Transformer...")
 
-    return X / std_X
+    # Generate theta, W and the payoff
+    theta = torch.zeros((N_calibration, len(intervals)), device=device)
+    for i, (low, high) in enumerate(intervals):
+        theta[:, i].uniform_(low, high)
+
+    W_dt = torch.normal(0.0, float(np.sqrt(dt)), size=(N_calibration, sampling_freq), device=device)
+
+    # Enable gradient tracking for theta and W
+    theta.requires_grad_(True)
+    W_dt.requires_grad_(True)
+
+    payoff_aritm = simulate_arithmetic_asian_option_payoff(N_calibration, sampling_freq, dt, W_dt, theta, device)
+    payoff_geom = simulate_geometric_asian_option_payoff(N_calibration, sampling_freq, dt, W_dt, theta, device)
+    label = payoff_aritm - payoff_geom
+
+    # Compute gradients of the label with respect to theta and W
+    grads_raw = torch.autograd.grad(outputs=label, inputs=[theta, W_dt], grad_outputs=torch.ones_like(label))
+    grads_theta = grads_raw[0]
+    grads_W_dt = grads_raw[1]
+
+    # Initialize and fit the transformer
+    transformer = DiffPCA(n_components_pca=1-1e-10, n_components_diff_pca=1-1e-2, device=device)
+    transformer.fit(theta.detach(), W_dt.detach(), label.detach(), grads_theta, grads_W_dt, intervals)
+
+    return transformer
 
 # -----------------------------------Dataset Generation-------------------------------------
 class PEMCDataset(IterableDataset):
     """
     Creates the training dataset.
     """
-    def __init__(self, num_samples, sampling_freq, intervals, dt, dim_X, device, batch_size):
+    def __init__(self, num_samples, sampling_freq, intervals, dt, device, batch_size, transformer):
         """
         Arguments:
             num_samples: total number of training samples.
             sampling_freq: sampling frequency.
             intervals: intervals used for uniform sampling of theta.
             dt: time discretization step.
-            dim_X: dimension of X.
             device: device where the data is stored (CPU/GPU).
             batch_size: size of the training batch.
+            transformer: object containing the transformation matrices and the scaling tensors.
         """
         super(PEMCDataset, self).__init__()
         self.device = device
@@ -220,14 +377,14 @@ class PEMCDataset(IterableDataset):
         self.sampling_freq = sampling_freq
         self.intervals = intervals
         self.dt = dt
-        self.dim_X = dim_X
         self.n_params = len(intervals)
         self.batch_size = batch_size
         self.batches_per_epoch = self.num_samples // self.batch_size + (self.num_samples % self.batch_size > 0)
-
+        self.transformer = transformer
 
     def __iter__(self):
         for batch_idx in range(self.batches_per_epoch):
+
             # Computation of the batch size in order to manage the last batch, that could be smaller than the previous ones
             current_batch_size = int(min(self.batch_size, self.num_samples - batch_idx * self.batch_size))
 
@@ -240,28 +397,26 @@ class PEMCDataset(IterableDataset):
 
             payoff_aritm = simulate_arithmetic_asian_option_payoff(current_batch_size, self.sampling_freq, self.dt, W_dt, theta, self.device)
             payoff_geom = simulate_geometric_asian_option_payoff(current_batch_size, self.sampling_freq, self.dt, W_dt, theta, self.device)
-            X = simulate_X(current_batch_size, W_dt, self.dim_X, self.device)
             label = payoff_aritm - payoff_geom
 
-            # Scale theta and X
-            theta_scaled = scale_theta(theta, self.intervals)
-            X_scaled = scale_X(X, self.dt, self.sampling_freq, self.dim_X)
+            # Transform theta, W_dt and the label
+            transformed_theta, transformed_W_dt, scaled_label = self.transformer.transform(theta, W_dt, label)
 
-            yield theta_scaled, X_scaled, label
+            yield transformed_theta.detach(), transformed_W_dt.detach(), scaled_label.detach()
 
 class ValidationDataset(IterableDataset):
     """
     Creates the validation dataset.
     """
-    def __init__(self, num_samples, sampling_freq, intervals, dt, dim_X, device):
+    def __init__(self, num_samples, sampling_freq, intervals, dt, device, transformer):
         """
         Arguments:
             num_samples: total number of training samples.
             sampling_freq: sampling frequency.
             intervals: intervals used for uniform sampling of theta.
             dt: time discretization step.
-            dim_X: dimension of X.
             device: device where the data is stored (CPU/GPU).
+            transformer: object containing the transformation matrices and the scaling tensors.
         """
         super(ValidationDataset, self).__init__()
         self.n_params = len(intervals)
@@ -273,39 +428,35 @@ class ValidationDataset(IterableDataset):
 
         W_dt = torch.normal(0.0, float(np.sqrt(dt)), size=(num_samples, sampling_freq), device=device)
 
-        # Generate all payoffs and X
+        # Generate all labels 
         payoff_aritm = simulate_arithmetic_asian_option_payoff(num_samples, sampling_freq, dt, W_dt, theta, device)
         payoff_geom = simulate_geometric_asian_option_payoff(num_samples, sampling_freq, dt, W_dt, theta, device)
-        X = simulate_X(num_samples, W_dt, dim_X, device)
         self.label = payoff_aritm - payoff_geom
 
-        # Scale theta and X
-        self.theta_scaled = scale_theta(theta, intervals)
-        self.X_scaled = scale_X(X, dt, sampling_freq, dim_X)
+        self.transformed_theta, self.transformed_W_dt = transformer.transform(theta, W_dt)
 
     def __iter__(self):
-        yield self.theta_scaled, self.X_scaled, self.label
+        yield self.transformed_theta.detach(), self.transformed_W_dt.detach(), self.label.detach()
 
 # --------------------------------Model------------------------------------------
 class PEMCNetwork(nn.Module):
     """
     Initializes the model.
     """
-    def __init__(self, x_dim, theta_hidden=256, combined_hidden=256, output_dim=1):
+    def __init__(self, transformed_theta_dim, transformed_W_dt_dim, theta_hidden=256, combined_hidden=256, output_dim=1):
         """
         Arguments:
-            x_dim: dimension of X.
+            transformed_theta_dim: dimension of the transformed theta.
+            transformed_W_dt_dim: dimension of the transformed W_dt.
             theta_hidden: number of neurons in each hidden layer of the theta network branch.
             combined_hidden: number of neurons in each hidden layer of the combined network.
             output_dim: dimension of the network's output.
         """
         super(PEMCNetwork, self).__init__()
 
-        self.x_dim = x_dim
-
         # Theta network branch
         self.theta_branch = nn.Sequential(
-            nn.Linear(4, theta_hidden),
+            nn.Linear(transformed_theta_dim, theta_hidden),
             nn.BatchNorm1d(theta_hidden),
             nn.ReLU(),
             nn.Dropout(0.5),
@@ -316,9 +467,9 @@ class PEMCNetwork(nn.Module):
         )
 
         # X network branch
-        x_hidden = max(32, 2 * x_dim)
+        x_hidden = max(32, 2 * transformed_W_dt_dim)
         self.x_branch = nn.Sequential(
-            nn.Linear(x_dim, x_hidden),
+            nn.Linear(transformed_W_dt_dim, x_hidden),
             nn.Dropout(0.5),
             nn.Linear(x_hidden, x_hidden),
             nn.Dropout(0.5)
@@ -391,7 +542,7 @@ class training:
     """
     Trains the model.
     """
-    def __init__(self, model, Ntrain, batch_size, sampling_freq, intervals, dt, dim_X, lr=1e-3):
+    def __init__(self, model, Ntrain, batch_size, sampling_freq, intervals, dt, transformer, lr=1e-3):
         """
         Arguments:
             model: "PEMCNetwork" object that represents the model used for training.
@@ -400,9 +551,9 @@ class training:
             sampling_freq: sampling frequency.
             intervals: intervals used for uniform sampling of theta.
             dt: temporal discretization step.
-            dim_X: dimension of X.
+            transformer: object containing the transformation matrices and the scaling tensors.
             lr: learning rate.
-        """      
+        """
         # Use GPU, if available, otherwise use CPU
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
@@ -413,7 +564,6 @@ class training:
         self.sampling_freq = sampling_freq
         self.intervals = intervals
         self.dt = dt
-        self.dim_X = dim_X
 
         # Model and training setup
         self.model = model.to(self.device).double()
@@ -425,13 +575,15 @@ class training:
         self.best_model_state = None
 
         # Initialize the training dataset and the DataLoader
-        self.train_dataset = PEMCDataset(Ntrain, sampling_freq, intervals, dt, dim_X, self.device, batch_size=self.batch_size)
+        self.train_dataset = PEMCDataset(Ntrain, sampling_freq, intervals, dt, self.device, batch_size=self.batch_size, transformer=transformer)
         self.train_loader = DataLoader(self.train_dataset, batch_size=None)
+
+        self.transformer = transformer
 
     def validate(self, val_loader):
         """
-        Compute MSE and modified MARE on the validation dataset.
-        
+        Computes MSE and modified MARE on the validation dataset.
+
         Arguments:
             val_loader: DataLoader for the validation set.
         """
@@ -439,16 +591,16 @@ class training:
 
         # Compute the validation losses on the whole validation set
         with torch.no_grad():
-            theta_val, x_val, y_val = next(iter(val_loader))
+            theta_val, x_val, y_val_descaled = next(iter(val_loader))
 
             # Compute the MSE loss to be used for hyperparameter tuning
-            output = self.model(theta_val, x_val)
-            loss = self.criterion(output, y_val)
+            output = self.model(theta_val, x_val) * self.transformer.y_std + self.transformer.y_mean
+            loss = self.criterion(output, y_val_descaled)
 
             # Compute the modified MARE loss to be used for early-stopping
             total_samples = theta_val.size(0)
             prediction = output.sum().item()
-            target = y_val.sum().item()
+            target = y_val_descaled.sum().item()
             avg_pred = prediction / total_samples
             avg_target = target / total_samples
             denom = abs(avg_target) if abs(avg_target) > 1e-9 else 1e-9
@@ -475,7 +627,7 @@ class training:
 
             for theta, x, y in self.train_loader:
 
-                # Create a batch of the dataset and train the model on it                
+                # Create a batch of the dataset and train the model on it
                 self.optimizer.zero_grad()
                 output = self.model(theta, x)
                 loss = self.criterion(output, y)
@@ -530,18 +682,16 @@ class evaluation:
     """
     Computes the MC, CV and Boost PEMC estimators.
     """
-    def __init__(self, dt, sampling_freq, dim_X, intervals):
+    def __init__(self, dt, sampling_freq, intervals):
         """
         Arguments:
             dt: time discretization step.
             sampling_freq: sampling frequency.
-            dim_X: dimension of X.
             intervals: intervals used for uniform sampling of theta.
         """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dt = dt
         self.sampling_freq = sampling_freq
-        self.dim_X = dim_X
         self.intervals = intervals
 
     def evaluate_MC(self, n, theta_tensor, batch_size):
@@ -552,7 +702,7 @@ class evaluation:
             n: sample size.
             theta_tensor: tensor that contains the evaluation parameters.
             batch_size: size of the batch used to compute the MC estimator.
-        """       
+        """
         # Batched MC evaluation
         sum_payoffs = torch.tensor(0.0, device=self.device)
         num_batches = n // batch_size + (n % batch_size > 0)
@@ -562,10 +712,8 @@ class evaluation:
 
                 # Accumulate the sum of payoffs for each batch
                 current_size = int(min(batch_size, n - i * batch_size))
-                W_dt = torch.normal(0.0, float(np.sqrt(self.dt)), size=(current_size, self.sampling_freq),
-                                    device=self.device)
-                payoff = simulate_arithmetic_asian_option_payoff(current_size, self.sampling_freq, self.dt, W_dt,
-                                                                 theta_tensor[:int(current_size)], self.device)
+                W_dt = torch.normal(0.0, float(np.sqrt(self.dt)), size=(current_size, self.sampling_freq), device=self.device)
+                payoff = simulate_arithmetic_asian_option_payoff(current_size, self.sampling_freq, self.dt, W_dt, theta_tensor[:int(current_size)], self.device)
                 sum_payoffs += torch.sum(payoff)
         return (sum_payoffs / n).item()
 
@@ -579,19 +727,14 @@ class evaluation:
         """
         W_dt = torch.normal(0.0, float(np.sqrt(self.dt)), size=(int(n), self.sampling_freq), device=self.device)
         theta_tensor = torch.tensor(theta, device=self.device).repeat(int(n), 1)
-        payoff_aritm = simulate_arithmetic_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor,
-                                                               self.device)
-        payoff_geom = simulate_geometric_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor,
-                                                             self.device)
-        expected_payoff_exact = geometric_asian_option_closed_form_expected_payoff(theta[0], theta[1], theta[2],
-                                                                                   theta[3],
-                                                                                   self.dt * self.sampling_freq,
-                                                                                   self.sampling_freq)
+        payoff_aritm = simulate_arithmetic_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor, self.device)
+        payoff_geom = simulate_geometric_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor, self.device)
+        expected_payoff_exact = geometric_asian_option_closed_form_expected_payoff(theta[0], theta[1], theta[2], theta[3], self.dt * self.sampling_freq, self.sampling_freq)
         cv = torch.mean(payoff_aritm - payoff_geom).item() + expected_payoff_exact
 
         return cv
 
-    def evaluate_Boost_PEMC(self, model, N, n, theta):
+    def evaluate_Boost_PEMC(self, model, N, n, theta, transformer):
         """
         Computes the Boost PEMC estimator.
 
@@ -600,42 +743,32 @@ class evaluation:
             N: N=10n.
             n: sample size.
             theta: vector of the evaluation parameters.
-        """  
+            transformer: object containing the transformation matrices and the scaling tensors.
+        """
         # Generate n paired samples (label, features)
         theta_tensor = torch.tensor(theta, device=self.device).repeat(int(n), 1)
         W_dt = torch.normal(0.0, float(np.sqrt(self.dt)), size=(int(n), self.sampling_freq), device=self.device)
-        f = simulate_arithmetic_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor,
-                                                    self.device)
-        payoff_geom = simulate_geometric_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor,
-                                                             self.device)
-        X = simulate_X(int(n), W_dt, self.dim_X, self.device)
+        f = simulate_arithmetic_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor, self.device)
+        payoff_geom = simulate_geometric_asian_option_payoff(int(n), self.sampling_freq, self.dt, W_dt, theta_tensor, self.device)
 
-        # Scale theta and X
-        theta_scaled = scale_theta(theta_tensor, self.intervals)
-        X_scaled = scale_X(X, self.dt, self.sampling_freq, self.dim_X)
-
-        # Generate N i.i.d. samples of X
+        # Generate N samples of theta and W_dt
         theta_tensor_tilda = torch.tensor(theta, device=self.device).repeat(int(N), 1)
         W_dt_tilda = torch.normal(0.0, float(np.sqrt(self.dt)), size=(int(N), self.sampling_freq), device=self.device)
-        X_tilda = simulate_X(int(N), W_dt_tilda, self.dim_X, self.device)
 
-        # Scale theta_tilda and X_tilda
-        theta_tilda_scaled = scale_theta(theta_tensor_tilda, self.intervals)
-        X_tilda_scaled = scale_X(X_tilda, self.dt, self.sampling_freq, self.dim_X)
+        transformed_theta, transformed_W_dt = transformer.transform(theta_tensor, W_dt, None)
+        transformed_theta_tilda, transformed_W_dt_tilda = transformer.transform(theta_tensor_tilda, W_dt_tilda, None)
 
-        expected_payoff_exact = geometric_asian_option_closed_form_expected_payoff(theta[0], theta[1], theta[2],
-                                                                                   theta[3],
-                                                                                   self.sampling_freq * self.dt,
-                                                                                   self.sampling_freq)
+
+        expected_payoff_exact = geometric_asian_option_closed_form_expected_payoff(theta[0], theta[1], theta[2], theta[3], self.sampling_freq * self.dt, self.sampling_freq)
 
         # Set the model to evaluation mode
         model.eval()
 
         # Run inference
         with torch.no_grad():
-            g = model(theta_scaled, X_scaled)
-            g_tilda = model(theta_tilda_scaled, X_tilda_scaled)
-            
+            g = model(transformed_theta, transformed_W_dt) * transformer.y_std + transformer.y_mean
+            g_tilda = model(transformed_theta_tilda, transformed_W_dt_tilda) * transformer.y_std + transformer.y_mean
+
         # Compute Boost PEMC estimator
         Boost_PEMC = torch.mean(f - payoff_geom - g) + torch.mean(g_tilda) + expected_payoff_exact
 
@@ -643,7 +776,7 @@ class evaluation:
 
 # ----------------------------Optuna optimization--------------------------------
 # Sampling parameters
-Ntrain = 128 * 10 ** 4
+Ntrain = 128 * 10 ** 2
 sampling_freq = 252
 intervals = [(0.01, 0.03), (80, 120), (0.05, 0.25), (90, 110)]  # (r,S0,sigma,K)
 dt = 1 / sampling_freq
@@ -651,7 +784,7 @@ dt = 1 / sampling_freq
 # Optuna parameters
 epochs = 200
 patience = 20
-n_trials = 100
+n_trials = 200
 
 # Get device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -659,13 +792,20 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 if torch.cuda.is_available():
     print(f"Running on: {torch.cuda.get_device_name(0)}")
 
+# Compute transformation matrices and the sacling tensors on a simulated dataset
+global_transformer = setup_global_pca(10000, sampling_freq, intervals, dt, device)
+
+dim_theta_trans = global_transformer.n_diff_theta
+dim_w_trans = global_transformer.n_diff_W
+print(f"Network input dims -> Theta: {dim_theta_trans}, W_dt: {dim_w_trans}")
+
 # Set the number of samples of the validation set
 val_dim = int(Ntrain * 0.1)
 
-def run_optuna_study(dim_X):
+def run_optuna_study():
 
     # Initialize the validation set for the hyperparameter tuning
-    hyperparameters_val_set = ValidationDataset(val_dim, sampling_freq, intervals, dt, dim_X, device)
+    hyperparameters_val_set = ValidationDataset(val_dim, sampling_freq, intervals, dt, device, global_transformer)
     hyperparameters_loader = DataLoader(hyperparameters_val_set, batch_size=None)
 
     def objective(trial):
@@ -677,8 +817,8 @@ def run_optuna_study(dim_X):
             combined_hidden = trial.suggest_int('combined_hidden', 16, 256)
 
             # Create the model
-            model = PEMCNetwork(x_dim=dim_X, theta_hidden=theta_hidden, combined_hidden=combined_hidden)
-            trainer = training(model, Ntrain, batch_size, sampling_freq, intervals, dt, dim_X, lr=1e-3)
+            model = PEMCNetwork(transformed_theta_dim=dim_theta_trans, transformed_W_dt_dim=dim_w_trans, theta_hidden=theta_hidden, combined_hidden=combined_hidden)
+            trainer = training(model, Ntrain, batch_size, sampling_freq, intervals, dt, global_transformer, lr=1e-3)
             trainer.fit(num_epochs=epochs, patience=patience, val_loader=early_stopping_loader)
 
             # Compute the MSE loss on the validation set for the hyperparameter tuning
@@ -710,10 +850,10 @@ if load_model:
         raise FileNotFoundError(f"Model file {MODEL_FILE} not found, run training first!")
 
     # Load the best hyperparameters
-    best_params = load_best_params(1, PARAMS_FILE)
+    best_params = load_best_params(dim_w_trans, PARAMS_FILE)
 
     # Create the model architecture
-    model = PEMCNetwork(x_dim=1, theta_hidden=best_params['theta_hidden'], combined_hidden=best_params['combined_hidden'])
+    model = PEMCNetwork(transformed_theta_dim=dim_theta_trans, transformed_W_dt_dim=dim_w_trans, theta_hidden=best_params['theta_hidden'], combined_hidden=best_params['combined_hidden'])
     model = model.to(device).double()
 
     # Upload weights and biases
@@ -725,25 +865,25 @@ if load_model:
 # Train the model
 else:
     # Initialize the validation set for early-stopping
-    early_stopping_val_set = ValidationDataset(val_dim, sampling_freq, intervals, dt, 1, device)
+    early_stopping_val_set = ValidationDataset(val_dim, sampling_freq, intervals, dt, device, global_transformer)
     early_stopping_loader = DataLoader(early_stopping_val_set, batch_size=None)
 
     # Load the best hyperparameters and just do the final retraining
     if use_saved_params:
         print(f"Loading hyperparameters from input...")
-        best_params = load_best_params(1, PARAMS_FILE)
+        best_params = load_best_params(dim_w_trans, PARAMS_FILE)
 
     # Run Optuna hyperparameter tuning
     else:
         print("Starting Optuna study...")
-        best_params = run_optuna_study(1)
-        save_best_params(best_params, 1, PARAMS_FILE)
+        best_params = run_optuna_study()
+        save_best_params(best_params, dim_w_trans, PARAMS_FILE)
 
     # Retrain with best hyperparameters
     print("Retraining with best hyperparameters...")
-    model = PEMCNetwork(x_dim=1, theta_hidden=best_params['theta_hidden'],
+    model = PEMCNetwork(transformed_theta_dim=dim_theta_trans, transformed_W_dt_dim=dim_w_trans, theta_hidden=best_params['theta_hidden'],
                           combined_hidden=best_params['combined_hidden'])
-    trainer = training(model, Ntrain, best_params['batch_size'], sampling_freq, intervals, dt, 1, lr=1e-3)
+    trainer = training(model, Ntrain, best_params['batch_size'], sampling_freq, intervals, dt, global_transformer, lr=1e-3)
     trainer.fit(num_epochs=epochs, patience=patience, val_loader=early_stopping_loader)
 
     print(f"Saving trained model to {MODEL_FILE}...")
@@ -772,7 +912,7 @@ batch_eval = 2048 * 1000
 # Set the seed for evaluation
 set_all_seeds(42)
 
-evaluator = evaluation(dt, sampling_freq, 1, intervals)
+evaluator = evaluation(dt, sampling_freq, intervals)
 theta_tensor = torch.tensor(theta_eval, device=device).repeat(batch_eval, 1)
 
 # Compute ground truth
@@ -799,45 +939,44 @@ print(f"Ground_truth:{ground_truth}")
 
 # Initialize arrays to store RMSE for each n
 rmseCV = np.zeros(len(n_values))
-rmseBoost_PEMC_1 = np.zeros(len(n_values))
+rmseBoost_PEMC = np.zeros(len(n_values))
 
 for i, n in enumerate(n_values):
     print(f"Evaluation with n={n}")
 
-    # Reset error accumulators for each n
     errCV = 0
-    errBoost_PEMC_1 = 0
+    errBoost_PEMC = 0
 
     for j in range(num_runs):
         current_seed = 42 + (i * 10000) + j
         set_all_seeds(current_seed)
         CV = evaluator.evaluate_CV(n, theta_eval)
-        Boost_PEMC_1 = evaluator.evaluate_Boost_PEMC(model, 10 * n, n, theta_eval)
+        Boost_PEMC = evaluator.evaluate_Boost_PEMC(model, 10 * n, n, theta_eval, global_transformer)
 
         errCV += (CV - ground_truth) ** 2
-        errBoost_PEMC_1 += (Boost_PEMC_1 - ground_truth) ** 2
+        errBoost_PEMC += (Boost_PEMC - ground_truth) ** 2
 
     # Compute RMSE for current n
     rmseCV[i] = np.sqrt(errCV / num_runs)
-    rmseBoost_PEMC_1[i] = np.sqrt(errBoost_PEMC_1 / num_runs)
+    rmseBoost_PEMC[i] = np.sqrt(errBoost_PEMC / num_runs)
 
 # Create a dataframe with the RMSE values for each estimator and value of n
 errors = pd.DataFrame(
-    data=[rmseBoost_PEMC_1, rmseCV],
+    data=[rmseBoost_PEMC, rmseCV],
     columns=[f'n={n}' for n in n_values],
-    index=['Boost PEMC (dim(X) = 1)', 'Geometric CV']
+    index=['Boost PEMC', 'Geometric CV']
 )
 print(errors)
 
 # Compute the percentage reduction of Boost PEMC with respect to MC
-Boost_PEMC_1_reduction = np.zeros(len(n_values))
+Boost_PEMC_reduction = np.zeros(len(n_values))
 for i, n in enumerate(n_values):
-  Boost_PEMC_1_reduction[i] = (errors[f'n={n}']['Geometric CV'] - errors[f'n={n}']['Boost PEMC (dim(X) = 1)']) / errors[f'n={n}']['Geometric CV']
+  Boost_PEMC_reduction[i] = (errors[f'n={n}']['Geometric CV'] - errors[f'n={n}']['Boost PEMC']) / errors[f'n={n}']['Geometric CV']
 
 # Create a datafame with the percentage reduction of Boost PEMC with respect to MC
 reductions = pd.DataFrame(
-    data=[Boost_PEMC_1_reduction],
+    data=[Boost_PEMC_reduction],
     columns=[f'n={n}' for n in n_values],
-    index=['Boost PEMC (dim(X) = 1)']
+    index=['Boost PEMC']
 )
 print(reductions.map(lambda x: f"{x:.3%}"))

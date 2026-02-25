@@ -1,0 +1,11 @@
+{
+    "params": {
+        "batch_size": 64,
+        "lr": 0.0009549300436481412,
+        "out_channels2d_1": 16,
+        "out_channels2d_2": 64,
+        "out_channels1d_1": 8,
+        "out_channels1d_2": 64,
+        "hidden_dim_synthesizer": 128
+    }
+}

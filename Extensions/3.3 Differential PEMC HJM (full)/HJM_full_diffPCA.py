@@ -46,7 +46,7 @@ def set_all_seeds(seed=42):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
+
 # Set seeds
 set_all_seeds(42)
 
@@ -74,7 +74,7 @@ def load_best_params(filename):
     return params[f"params"]
 
 # -----------------------------Simulations---------------------------------------
-class HJMGridContext:
+class HJMContext:
     """
     Manages the time grids, indices, and pre-calculated tensors for the 
     Heath-Jarrow-Morton (HJM) framework simulation.
@@ -106,7 +106,7 @@ class HJMGridContext:
         # Used for splitting Brownian motion paths (Midpoint)
         self.half_idx = self.N_time // 2
 
-        # Calculates (T - t) matrix for all points on the grid
+        # Calculate (T - t) matrix for all points on the grid
         t_col = self.grid_T[:self.N_time].unsqueeze(1)
         T_row = self.grid_T.unsqueeze(0)
         self.tau = (T_row - t_col).unsqueeze(0)
@@ -128,19 +128,14 @@ class HJMGridContext:
         # Payment indices relative to the start of the pricing slice
         self.pay_indices = (torch.arange(1, n_p + 1, device=device) * steps_per_year).long()
 
-
-def simulate_hjm_swaption(ctx, sigma0_vec, alpha_sigma_vec, f0_vec, c_f_vec, alpha_f_vec, n_paths, C, train=True, only_inputs=False, only_payoff=False):
+def simulate_sigma_f0(ctx, sigma0_vec, alpha_sigma_vec, f0_vec, c_f_vec, alpha_f_vec, n_paths, train=True):
     """
-    Simulates the HJM model to price a Swaption.
-    
-    Arguments:  
-        ctx: HJMGridContext object.
+    Simulates the volatility surfaces and the initial forward curves.
+
+    Arguments:
         sigma0_vec, alpha_sigma_vec, f0_vec, c_f_vec, alpha_f_vec: parameters of the base volatility surface and the intitial forward curve.
         n_paths: number of paths to generate.
-        C: notional amount.
         train: if True, adds a Gaussian noise to the base volatility surface and the initial forward curve.
-        only_inputs: if True, generate and return only the volatility grid, the initial forward curve and X.   
-        only_payoff: if True, return only the payoff.
     """
 
     # Reshape inputs for broadcasting
@@ -166,21 +161,57 @@ def simulate_hjm_swaption(ctx, sigma0_vec, alpha_sigma_vec, f0_vec, c_f_vec, alp
         f0_batch = f_det_curve
         sigma_total = sigma_det_base
 
-    # Generate Brownian Motion increments (dW)
-    dW = torch.randn((n_paths, ctx.N_time, 1), device=ctx.device) * ctx.sqrt_dt
-    
-    # Split the Brownian path into two halves: X=(X1, X2)
-    X1 = torch.sum(dW[:, :ctx.half_idx, :], dim=1)
-    X2 = torch.sum(dW[:, ctx.half_idx:, :], dim=1)
-    X = torch.cat([X1, X2], dim=1)
+    return sigma_total, f0_batch
 
-    # If only_inputs=True, generate and return only the volatility grid, the initial forward curve and X.   
+def simulate_hjm_swaption(ctx, C, sigma0_vec=None, alpha_sigma_vec=None, f0_vec=None, c_f_vec=None, alpha_f_vec=None, n_paths=None, sigma_total=None, f0_batch=None, dW=None, train=True, only_inputs=False, only_payoff=False):
+    """
+    Simulates the HJM model to price a Swaption.
+    
+    Arguments:  
+        ctx: HJMContext object.
+        C: notional amount.
+        sigma0_vec, alpha_sigma_vec, f0_vec, c_f_vec, alpha_f_vec: parameters of the base volatility surface and the intitial forward curve.
+        n_paths: number of paths to generate.
+        sigma_total: precomputed volatility grids.
+        f0_batch: precomputed initial forward curves. 
+        dW: pre-computed tensor of Brownian motion increments.
+        train: if True, adds a Gaussian noise to the base volatility surface and the initial forward curve.
+        only_inputs: if True, generate and return only the volatility grid, the initial forward curve and X.   
+        only_payoff: if True, return only the payoff.
+    """
+
+    if sigma_total is None and f0_batch is None:
+
+        # Reshape inputs for broadcasting
+        sigma0 = sigma0_vec.view(n_paths, 1, 1)
+        alpha_sigma = alpha_sigma_vec.view(n_paths, 1, 1)
+        f0 = f0_vec.view(n_paths, 1)
+        c_f = c_f_vec.view(n_paths, 1)
+        alpha_f = alpha_f_vec.view(n_paths, 1)
+        T_grid_view = ctx.grid_T.unsqueeze(0)
+
+        # Compute the base volatility surface and the initial forward curve in (3.16)-(3.17)
+        f_det_curve = f0 + c_f * (1.0 - torch.exp(-alpha_f * T_grid_view))
+        sigma_det_base = sigma0 * torch.exp(-alpha_sigma * ctx.tau) * ctx.mask_tau
+
+        # If train=True, add a Gaussian noise to the base volatility surface and the initial forward curve
+        if train:
+            noise_f = torch.randn((n_paths, ctx.N_mat), device=ctx.device) * ctx.std_f.squeeze(1)
+            f0_batch = f_det_curve + noise_f
+            std_sigma_vec = sigma0 / (2.0 * ctx.T_vector)
+            noise_sigma = torch.randn((n_paths, 1, ctx.N_mat), device=ctx.device) * std_sigma_vec
+            sigma_total = (sigma_det_base + noise_sigma) * ctx.mask_tau
+        else:
+            f0_batch = f_det_curve
+            sigma_total = sigma_det_base
+
+    if dW is None:
+        # Generate Brownian Motion increments (dW)
+        dW = torch.randn((sigma_total.shape[0], ctx.N_time, 1), device=ctx.device) * ctx.sqrt_dt
+
+    # If only_inputs=True, generate and return only the volatility grid, the initial forward curve and dW
     if only_inputs:
-        grid_dim = 64
-        f0_input = F.interpolate(f0_batch.unsqueeze(1), size=grid_dim, mode='linear', align_corners=False).squeeze(1)
-        sigma_input = F.interpolate(sigma_total.unsqueeze(1), size=(grid_dim, grid_dim), mode='bilinear',
-                                    align_corners=False).squeeze(1)
-        return sigma_input, f0_input, X, None
+        return sigma_total, f0_batch, dW
 
     # Discretization of the dynamics of the forward rates curve
 
@@ -213,7 +244,7 @@ def simulate_hjm_swaption(ctx, sigma0_vec, alpha_sigma_vec, f0_vec, c_f_vec, alp
     # Integrate forward rates to get the bond prices 
     integral_f = torch.cumsum(f_pricing, dim=1) * ctx.dt
 
-    # In the (3.18) the summation ends at j-1
+    # In (3.18) the summation ends at j-1
     target_indices = ctx.pay_indices - 1
 
     # Computation of (3.18)
@@ -225,25 +256,280 @@ def simulate_hjm_swaption(ctx, sigma0_vec, alpha_sigma_vec, f0_vec, c_f_vec, alp
     val = C * ((1.0 - R_batch) * sum_B * ctx.dt_swap + B_end - 1.0)
     payoff = torch.clamp(val, min=0.0).unsqueeze(1)
 
-    # If only_payoff=True, return just the payoff avoiding the interpolation of sigma and f0
     if only_payoff:
-        return None, None, None, payoff
+        return payoff
 
-    grid_dim = 64
-    f0_input = F.interpolate(f0_batch.unsqueeze(1), size=grid_dim, mode='linear', align_corners=False).squeeze(1)
-    sigma_input = F.interpolate(sigma_total.unsqueeze(1), size=(grid_dim, grid_dim), mode='bilinear',
-                                align_corners=False).squeeze(1)
+    return sigma_total, f0_batch, dW, payoff
 
-    return sigma_input, f0_input, X, payoff
+# ------------------------------Preprocessing-----------------------------------
+class DiffPCA:
+    """
+    Applies the "full" data transformation step of the Differential PEMC.
 
+    """
+    def __init__(self, n_components_pca=1-1e-10, n_components_diff_pca=1-1e-4, device='cuda'):
+        """
+        Arguments:
+            n_components_pca: number of desired PCA components (if >=1) or minimum percentage level of 'variance' (squared magnitude) explained by the desired PCA components (if <1).
+            n_components_diff_pca: number of desired differential PCA components (if >=1) or minimum percentage level of 'variance' (squared magnitude) explained by the desired differential PCA components (if <1).
+            device: device where the data is stored (CPU/GPU).
+        """
+        self.n_components_pca = n_components_pca
+        self.n_components_diff_pca = n_components_diff_pca
+        self.device = device
+        
+        self.mu_x = None
+        self.y_mean = None
+        self.y_std = None
+        
+        self.P2 = None         
+        self.d2_inv_sqrt = None 
+        self.d2_sqrt = None   
+        self.n_pca = None
+        
+        self.P3 = None         
+        self.n_diff = None
+
+    def build_X(self, W_dt, sigma, f0):
+        """
+        Flattens and concatenates the input data.
+
+        Arguments:
+            W_dt: Brownian motion increments.
+            sigma: volatility surface.
+            f0: initial forward curve.
+        """
+        W_dt_flat = W_dt.reshape(W_dt.shape[0], -1)
+        sigma_flat = sigma.reshape(sigma.shape[0], -1)
+        f0_flat = f0.reshape(f0.shape[0], -1)
+
+        return torch.cat((W_dt_flat, sigma_flat, f0_flat), dim=1)
+
+    def compute_pca(self, A, n_components):
+        """
+        Applies PCA (or differential PCA) to the input data, automatically using PCA for high-dimensional inputs if necessary.
+
+        Arguments:
+            A: input matrix.
+            n_components: number of components to keep (if >=1) or minimum percentage level of 'variance' (or relevance) explained by the components to keep (if <1).
+        """
+        n_samples, n_features = A.shape
+        use_dual = n_samples < n_features
+        
+        # Perform eigenvalue decomposition
+        if use_dual:
+            K = A @ A.T / n_samples
+            d, U = torch.linalg.eigh(K)
+        else:
+            C = A.T @ A / n_samples
+            d, P = torch.linalg.eigh(C)
+
+        # Order descending
+        d = torch.flip(d, dims=[0])
+        if use_dual:
+            U = torch.flip(U, dims=[1])
+        else:
+            P = torch.flip(P, dims=[1])
+
+        # Compute the number of components to keep
+        sumd = torch.cumsum(d, dim=0)
+        total_variance = sumd[-1]
+
+        if n_components is not None:
+            if n_components >= 1:
+                self.n_components_ = int(n_components)
+            else:
+                sumd_ratio = sumd / total_variance
+                target_val = torch.tensor(n_components, device=d.device)
+                self.n_components_ = torch.searchsorted(sumd_ratio, target_val).item() + 1
+        else:
+            self.n_components_ = min(n_samples, n_features)
+            
+        d_reduced = d[:self.n_components_]
+    
+        if use_dual:
+            # Retrieve the eigenvectors of the original matrix and normalized them (||.||=1).
+            U_reduced = U[:, :self.n_components_]
+            P_reduced = A.T @ U_reduced
+            P_reduced = F.normalize(P_reduced, p=2, dim=0)
+        else:
+            P_reduced = P[:, :self.n_components_]
+            
+        return d_reduced, P_reduced, self.n_components_
+
+    def fit(self, W_dt, sigma, f0, y, grads):
+        """
+        Fits the transformation matrices and the scaling tensors.
+
+        Arguments:
+            W_dt: Brownian motion increments.
+            sigma: volatility surface.
+            f0: initial forward curve.
+            y: label.
+            grads: gradients of the label with respect to theta and W_dt. 
+        """
+        # Move inputs to CPU
+        W_dt = W_dt.cpu()
+        sigma = sigma.cpu()
+        f0 = f0.cpu()
+        y = y.cpu()
+        grads = grads.cpu()
+
+        # Concatenate inputs
+        X0 = self.build_X(W_dt, sigma, f0)        
+
+        # Center the concatenated inputs
+        self.mu_x = torch.mean(X0, dim=0)
+        n_w_dt = W_dt.reshape(W_dt.shape[0], -1).shape[1]
+
+        self.mu_x[:n_w_dt] = 0.0
+
+        X1 = X0 - self.mu_x
+        
+        self.y_mean = torch.mean(y)
+        self.y_std = torch.std(y)
+        
+        # Scale gradients 
+        Z1 = grads / self.y_std
+        
+        # Apply PCA 
+        d2, self.P2, self.n_pca = self.compute_pca(X1, self.n_components_pca)
+        
+        self.d2_inv_sqrt = torch.diag(1.0 / torch.sqrt(d2)) 
+        self.d2_sqrt = torch.diag(torch.sqrt(d2))           
+        
+        # Update differentials
+        Z2 = (Z1 @ self.P2) @ self.d2_sqrt
+        
+        # Apply differential PCA 
+        _, self.P3, self.n_diff = self.compute_pca(Z2, self.n_components_diff_pca)
+                
+        print(f"(W, sigma, f0): dim: {X0.shape[1]} -> PCA: {self.n_pca} -> DiffPCA: {self.n_diff}")
+
+        # Move learned parameters to GPU
+        self.mu_x = self.mu_x.to(self.device)
+        self.y_mean = self.y_mean.to(self.device)
+        self.y_std = self.y_std.to(self.device)
+        
+        self.P2 = self.P2.to(self.device)
+        self.d2_inv_sqrt = self.d2_inv_sqrt.to(self.device)
+        self.d2_sqrt = self.d2_sqrt.to(self.device)
+        
+        self.P3 = self.P3.to(self.device)
+
+        # Clear CPU memory
+        del X0, grads, Z2, W_dt, sigma, f0, y
+
+    def transform(self, W_dt, sigma, f0, y=None):
+        """
+        Transforms the inputs and the label using the fitted tensors.
+
+        Arguments:
+            W_dt: Brownian motion increments.
+            sigma: volatility surface.
+            f0: initial forward curve.
+            y: label.
+        """
+        # Concatenate inputs
+        X0 = self.build_X(W_dt, sigma, f0)
+        
+        # Transformation pipeline
+        X1 = X0 - self.mu_x
+        
+        X2 = (X1 @ self.P2) @ self.d2_inv_sqrt
+        
+        X3 = X2 @ self.P3
+        
+        if y is None:
+            return X3
+        else:
+            # Return normalized label
+            return X3, (y - self.y_mean) / self.y_std
+        
+def setup_global_pca(N_calibration, intervals, T, device, C, t0, dt_swap, n_p, dt_grid, gen_batch_size=1024):
+    """
+    Fits the transformation matrices and the scaling tensors once for all.
+
+    Arguments:
+        N_calibration: total number of training samples.
+        intervals: intervals used for uniform sampling of theta.
+        T: time to maturity of the derivative.
+        device: device where the data is stored (CPU/GPU).
+        C: notional amount.
+        t0: starting time of the swap and maturity of the swaption.
+        dt_swap: length of each swap payment period.
+        n_p: number of swap payment periods. 
+        dt_grid: temporal discretization step.
+        gen_batch_size: size of the data generation batch.
+    """        
+
+    print("Initializing Global PCA Transformer...")
+    
+    ctx = HJMContext(0, T, dt_grid, t0, dt_swap, n_p, device)
+
+    # Lists to collect results
+    sigma_list, f0_list, W_dt_list, payoff_list = [], [], [], []
+    grads_list = []
+
+    for i in range(0, N_calibration, gen_batch_size):
+        current_bs = min(gen_batch_size, N_calibration - i)
+        
+        # Generate batch of theta, W and the payoff
+        chunk_theta = torch.zeros((current_bs, len(intervals)), device=device)
+        for k, (low, high) in enumerate(intervals):
+            chunk_theta[:, k].uniform_(low, high)
+        
+        c_W_dt = torch.randn((current_bs, ctx.N_time, 1), device=device) * ctx.sqrt_dt
+        
+        # Enable gradient tracking for the batch of W
+        c_W_dt.requires_grad_(True)
+        
+        with torch.no_grad():
+            # Simulate sigma and f0
+            c_sigma, c_f0 = simulate_sigma_f0(ctx, chunk_theta[:, 0], chunk_theta[:, 1], chunk_theta[:, 2], chunk_theta[:, 3], chunk_theta[:, 4], current_bs)
+
+        # Enable gradient tracking for the batch of sigma and f0
+        c_sigma.requires_grad_(True)
+        c_f0.requires_grad_(True)
+
+        _, _ ,_ , c_payoff = simulate_hjm_swaption(ctx, C, sigma_total=c_sigma, f0_batch=c_f0, dW=c_W_dt)
+
+        # Compute gradients of the label with respect to W, sigma and f0
+        grads_raw = torch.autograd.grad(outputs=c_payoff, inputs=[c_W_dt, c_sigma, c_f0], grad_outputs=torch.ones_like(c_payoff), retain_graph=False)
+        
+        # Store detached results
+        W_dt_list.append(c_W_dt.detach().cpu())
+        sigma_list.append(c_sigma.detach().cpu())
+        f0_list.append(c_f0.detach().cpu())
+        payoff_list.append(c_payoff.detach().cpu())
+        
+        batch_grads = torch.cat([g.reshape(current_bs, -1) for g in grads_raw], dim=1)
+        grads_list.append(batch_grads.detach().cpu())
+
+        # Clean cache
+        del chunk_theta, c_W_dt, c_sigma, c_f0, c_payoff, grads_raw, batch_grads
+        torch.cuda.empty_cache()
+
+    # Concatenate all batches
+    sigma = torch.cat(sigma_list, dim=0)
+    f0 = torch.cat(f0_list, dim=0)
+    W_dt = torch.cat(W_dt_list, dim=0)
+    payoff = torch.cat(payoff_list, dim=0)
+    
+    grads = torch.cat(grads_list, dim=0)
+
+    # Initialize and fit the transformer
+    transformer = DiffPCA(n_components_pca=1-1e-10, n_components_diff_pca=1-1e-3, device=device)
+    transformer.fit(W_dt, sigma, f0, payoff, grads)
+
+    return transformer
 
 # -----------------------------------Dataset-------------------------------------
 class PEMCDataset(IterableDataset):
     """
     Creates the training dataset.
     """
-    def __init__(self, num_samples, intervals, T, device, batch_size, C, t0, dt_swap, n_p, dt_grid,
-                 sim_chunk_size=2048):
+    def __init__(self, num_samples, intervals, T, device, batch_size, C, t0, dt_swap, n_p, dt_grid, transformer, sim_chunk_size=2048):
         """
         Arguments:
             num_samples: total number of training samples.
@@ -256,6 +542,7 @@ class PEMCDataset(IterableDataset):
             dt_swap: length of each swap payment period.
             n_p: number of swap payment periods. 
             dt_grid: temporal discretization step.
+            transformer: object containing the transformation matrices and the scaling tensors.
             sim_chunk_size: dimension of each chunk that is simulated together and accumulated to form a batch.
         """
         super(PEMCDataset, self).__init__()
@@ -272,7 +559,9 @@ class PEMCDataset(IterableDataset):
         self.sim_chunk_size = sim_chunk_size
 
         self.batches_per_epoch = num_samples // batch_size + (num_samples % batch_size > 0)
-        self.ctx = HJMGridContext(0, T, dt_grid, t0, dt_swap, n_p, device)
+        self.ctx = HJMContext(0, T, dt_grid, t0, dt_swap, n_p, device)
+
+        self.transformer = transformer        
 
     def __iter__(self):
         for batch_idx in range(self.batches_per_epoch):
@@ -281,7 +570,7 @@ class PEMCDataset(IterableDataset):
             target_batch_size = min(self.batch_size, self.num_samples - batch_idx * self.batch_size)
 
             # Lists to collect the results from chunks
-            thetas, sigmas, f0s, Xs, payoffs = [], [], [], [], []
+            sigmas, f0s, W_dts, payoffs = [], [], [], []
 
             # Generate batch on-the-fly dividing it in smaller chunks to allow bigger batch dimension
             with torch.no_grad():
@@ -294,27 +583,30 @@ class PEMCDataset(IterableDataset):
                     for k, (low, high) in enumerate(self.intervals):
                         chunk_theta[:, k].uniform_(low, high)
 
-                    c_sigma, c_f0, c_X, c_payoff = opt_hjm_train(self.ctx, chunk_theta[:, 0], chunk_theta[:, 1],
-                                                                 chunk_theta[:, 2],
-                                                                 chunk_theta[:, 3], chunk_theta[:, 4],
-                                                                 current_chunk_size, self.C)
+                    c_W_dt = torch.randn((current_chunk_size, self.ctx.N_time, 1), device=self.device) * self.ctx.sqrt_dt
+    
+                    c_sigma, c_f0 = opt_sigma_f0(self.ctx, chunk_theta[:, 0], chunk_theta[:, 1], chunk_theta[:, 2], chunk_theta[:, 3], chunk_theta[:, 4], current_chunk_size)
 
-                    thetas.append(chunk_theta)
+                    _, _, _, c_payoff = opt_hjm(self.ctx, self.C, sigma_total=c_sigma, f0_batch=c_f0, dW=c_W_dt)
+
                     sigmas.append(c_sigma)
                     f0s.append(c_f0)
-                    Xs.append(c_X)
+                    W_dts.append(c_W_dt)
                     payoffs.append(c_payoff)
 
-                # Concatente the results of the chunked simulation into the batch
-                batch_data = (torch.cat(thetas), torch.cat(sigmas), torch.cat(f0s), torch.cat(Xs), torch.cat(payoffs))
+                sigma_batch = torch.cat(sigmas, dim=0)
+                f0_batch = torch.cat(f0s, dim=0)
+                W_dt_batch = torch.cat(W_dts, dim=0)
+                payoff_batch = torch.cat(payoffs, dim=0)
 
-            yield batch_data
+                transformed_input, scaled_label = self.transformer.transform(W_dt_batch, sigma_batch, f0_batch, payoff_batch)            
+            yield transformed_input.detach(), scaled_label.detach()
 
 class ValidationDataset(IterableDataset):
     """
     Creates the validation dataset.
     """
-    def __init__(self, num_samples, intervals, T, device, C, t0, dt_swap, n_p, dt_grid, gen_batch_size=4096,
+    def __init__(self, num_samples, intervals, T, device, C, t0, dt_swap, n_p, dt_grid, transformer, gen_batch_size=4096,
                  yield_batch_size=4096):
         """
         Arguments:
@@ -327,6 +619,7 @@ class ValidationDataset(IterableDataset):
             dt_swap: length of each swap payment period.
             n_p: number of swap payment periods. 
             dt_grid: temporal discretization step.
+            transformer: object containing the transformation matrices and the scaling tensors.
             gen_batch_size: size of each batch that is simulated together and accumulated to form the dataset.
             yield_batch_size: dimension of each batch that is yielded.
         """
@@ -335,13 +628,12 @@ class ValidationDataset(IterableDataset):
         self.num_samples = num_samples
         self.yield_batch_size = yield_batch_size
         self.n_params = len(intervals)
-        self.ctx = HJMGridContext(0, T, dt_grid, t0, dt_swap, n_p, device)
+        self.ctx = HJMContext(0, T, dt_grid, t0, dt_swap, n_p, device)
 
         # Lists to collect the results from batches
-        theta_list = []
         sigma_list = []
         f0_list = []
-        X_list = []
+        W_dt_list = []
         payoff_list = []
 
         # Generate the full dataset dividing it in smaller batches
@@ -353,94 +645,40 @@ class ValidationDataset(IterableDataset):
                 for k, (low, high) in enumerate(intervals):
                     chunk_theta[:, k].uniform_(low, high)
 
-                c_sigma, c_f0, c_X, c_payoff = opt_hjm_train(self.ctx, chunk_theta[:, 0], chunk_theta[:, 1],
-                                                             chunk_theta[:, 2],
-                                                             chunk_theta[:, 3], chunk_theta[:, 4], current_bs, C)
+                c_W_dt = torch.randn((current_bs, self.ctx.N_time, 1), device=device) * self.ctx.sqrt_dt
+    
+                c_sigma, c_f0 = opt_sigma_f0(self.ctx, chunk_theta[:, 0], chunk_theta[:, 1], chunk_theta[:, 2], chunk_theta[:, 3], chunk_theta[:, 4], current_bs)
 
-                theta_list.append(chunk_theta)
+                _, _, _, c_payoff = opt_hjm(self.ctx, C, sigma_total=c_sigma, f0_batch=c_f0, dW=c_W_dt)
+
                 sigma_list.append(c_sigma)
                 f0_list.append(c_f0)
-                X_list.append(c_X)
+                W_dt_list.append(c_W_dt)
                 payoff_list.append(c_payoff)
 
                 torch.cuda.empty_cache()
 
             # Concatenate all batches into the final tensors
-            self.theta = torch.cat(theta_list, dim=0)
-            self.sigma = torch.cat(sigma_list, dim=0)
-            self.f0 = torch.cat(f0_list, dim=0)
-            self.X = torch.cat(X_list, dim=0)
+            sigma = torch.cat(sigma_list, dim=0)
+            f0 = torch.cat(f0_list, dim=0)
+            W_dt = torch.cat(W_dt_list, dim=0)
             self.payoff = torch.cat(payoff_list, dim=0)
+
+            self.transformed_input = transformer.transform(W_dt, sigma, f0)
 
     def __iter__(self):
         # Yield the validation dataset in batches
         for i in range(0, self.num_samples, self.yield_batch_size):
             end = min(i + self.yield_batch_size, self.num_samples)
-            yield (self.theta[i:end], self.sigma[i:end], self.f0[i:end], self.X[i:end], self.payoff[i:end])
+            yield (self.transformed_input[i:end], self.payoff[i:end])
 
 
 # --------------------------------Model------------------------------------------
-class FunctionEncoder2D(nn.Module):
-    """
-    Initializes the 2D function encoder branch.
-    """
-    def __init__(self, c_in=1, ch1=32, ch2=32):
-        """
-        Arguments:
-            c_in: number of input channels of the first convolutional layer.
-            ch1: number of output channels of the first convolutional layer.
-            ch2: number of output channels of the second convolutional layer.
-        """
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(c_in, ch1, kernel_size=(1, 3), stride=(1, 3), padding=0),
-            nn.BatchNorm2d(ch1),
-            nn.ReLU(),
-            nn.Conv2d(ch1, ch2, kernel_size=(1, 3), stride=(1, 3), padding=0),
-            nn.BatchNorm2d(ch2),
-            nn.ReLU(),
-            nn.AvgPool2d(kernel_size=(2, 2), stride=(2, 2), padding=0),
-            nn.Flatten()
-        )
-
-    def forward(self, x):
-        if x.dim() == 3: x = x.unsqueeze(1)
-        return self.net(x)
-
-
-class FunctionEncoder1D(nn.Module):
-    """
-    Initializes the 1D function encoder branch.
-    """
-    def __init__(self, c_in=1, ch1=16, ch2=16):
-        """
-        Arguments:
-            c_in: number of input channels of the first convolutional layer.
-            ch1: number of output channels of the first convolutional layer.
-            ch2: number of output channels of the second convolutional layer.
-        """
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(c_in, ch1, kernel_size=10, stride=3, padding=0),
-            nn.BatchNorm1d(ch1),
-            nn.ReLU(),
-            nn.Conv1d(ch1, ch2, kernel_size=10, stride=3, padding=0),
-            nn.BatchNorm1d(ch2),
-            nn.ReLU(),
-            nn.AvgPool1d(kernel_size=2, stride=2, padding=0),
-            nn.Flatten()
-        )
-
-    def forward(self, x):
-        if x.dim() == 2: x = x.unsqueeze(1)
-        return self.net(x)
-
-
-class VectorFeatureEncoder(nn.Module):
+class PEMCNetwork(nn.Module): 
     """
     Initializes the vector features encoder branch.
     """
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self, input_dim, hidden_dim=512, output_dim=1):
         """
         Arguments: 
             input_dim: input dimension.
@@ -448,138 +686,59 @@ class VectorFeatureEncoder(nn.Module):
             output_dim: output dimension.
         """
         super().__init__()
-        self.block1 = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim)
-        )
-
-        self.shortcut_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim)
-        )
-
-        self.relu = nn.ReLU()
-
-        self.block2 = nn.Sequential(
-            nn.Linear(hidden_dim, output_dim),
-            nn.BatchNorm1d(output_dim),
-            nn.ReLU()
-        )
-
-    def forward(self, x):
-        out = self.block1(x)
-        shortcut = self.shortcut_projection(x)
-        out += shortcut
-        out = self.relu(out)
-        out = self.block2(out)
-        return out
-
-
-class PEMCNetwork(nn.Module):
-    """
-    Initializes the whole architecture of the model.
-    """
-    def __init__(self, out_channels2d_1, out_channels2d_2, out_channels1d_1, out_channels1d_2, hidden_dim_synthesizer):
-        """
-        Arguments:
-            out_channels2d_1: number of output channels of the first convolutional layer of the 2D function encoder.
-            out_channels2d_2: number of output channels of the second convolutional layer of the 2D function encoder. 
-            out_channels1d_1: number of output channels of the first convolutional layer of the 1D function encoder.
-            out_channels1d_2: number of output channels of the second convolutional layer of the 1D function encoder.
-            hidden_dim_synthesizer: number of neurons in the hidden layers of the synthesizer
-        """
-        super().__init__()
-
-        self.dim_2d_side = 64
-        self.dim_1d_len = 64
-        self.vec_dim = 7
-        self.enc_vec_hidden_dim = 512
-        self.enc_vec_output_dim = 128
-
-        self.enc_2d = FunctionEncoder2D(ch1=out_channels2d_1, ch2=out_channels2d_2)
-        self.enc_1d = FunctionEncoder1D(ch1=out_channels1d_1, ch2=out_channels1d_2)
-        self.enc_vec = VectorFeatureEncoder(input_dim=self.vec_dim, hidden_dim=self.enc_vec_hidden_dim,
-                                            output_dim=self.enc_vec_output_dim)
-
-        # Calculate flattened size after CNN and AvgPool (fomulas in the PyTorch documentation of Conv2d and AvgPool2d)
-        h1 = self.dim_2d_side
-        w1 = (self.dim_2d_side - 3) // 3 + 1
-
-        h2 = h1
-        w2 = (w1 - 3) // 3 + 1
-
-        h_out = h2 // 2
-        w_out = w2 // 2
-        flat_dim_2d = out_channels2d_2 * h_out * w_out
-
-        # Calculate flattened size after CNN and AvgPool (fomulas in the PyTorch documentation of Conv1d and AvgPool1d)
-        l1 = (self.dim_1d_len - 10) // 3 + 1
-
-        l2 = (l1 - 10) // 3 + 1
-
-        l_out = l2 // 2
-
-        flat_dim_1d = out_channels1d_2 * l_out
-
-        flat_dim_vec = self.enc_vec_output_dim
-
-        syn_in = flat_dim_2d + flat_dim_1d + flat_dim_vec + self.vec_dim
 
         self.synthesizer_in = nn.Sequential(
-            nn.Linear(syn_in, hidden_dim_synthesizer),
-            nn.BatchNorm1d(hidden_dim_synthesizer)
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim)
         )
 
-        self.relu = nn.ReLU()
-
         self.projection = nn.Sequential(
-            nn.Linear(syn_in, hidden_dim_synthesizer),
-            nn.BatchNorm1d(hidden_dim_synthesizer)
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim)
         )
 
         self.synthesizer_hidden = nn.Sequential(
-            nn.Linear(hidden_dim_synthesizer, hidden_dim_synthesizer),
-            nn.BatchNorm1d(hidden_dim_synthesizer)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim)
         )
 
-        self.synthesizer_out = nn.Linear(hidden_dim_synthesizer, 1)
+        self.synthesizer_out = nn.Linear(hidden_dim, output_dim)
+        
 
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        if isinstance(m, (nn.Linear, nn.Conv2d, nn.Conv1d)):
+        if isinstance(m, nn.Linear):
+            # Initialize weights
             nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+            
+            # Initialize all bias values to zero
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    def forward(self, theta, sigma, f0, x):
+    def forward(self, input):
 
-        if x.dim() == 1:
-            x = x.unsqueeze(1)
+        out_1 = self.synthesizer_in(input)  
 
-        x_vec = torch.cat([theta, x], dim=1)
+        # Skip connection
+        shortcut_1 = self.projection(input)  
+        x2 = F.relu(out_1 + shortcut_1)
 
-        f2 = self.enc_2d(sigma)
-        f1 = self.enc_1d(f0)
-        fv = self.enc_vec(x_vec)
-
-        combined = torch.cat([f2, fv, f1, x_vec], dim=1)
-       
-        out_1 = self.synthesizer_in(combined)  
-        shortcut_1 = self.projection(combined)  
-        x2 = self.relu(out_1 + shortcut_1)
         out_2 = self.synthesizer_hidden(x2)
-        x3 = self.relu(out_2 + x2)
-        out = self.synthesizer_out(x3)
 
-        return out
+        # Skip connection
+        x3 = F.relu(out_2 + x2)
+
+        output = self.synthesizer_out(x3)    
+        
+        return output
 
 # -------------------------Training------------------------------------------
 class training:
     """
     Trains the model.
     """
-    def __init__(self, model, Ntrain, batch_size, intervals, T, C, t0, dt_swap, n_p, dt_grid, lr):
+    def __init__(self, model, Ntrain, batch_size, intervals, T, C, t0, dt_swap, n_p, dt_grid, lr, transformer):
         """
         Arguments:
             model: "PEMCNetwork" object that represents the model used for training.
@@ -592,6 +751,7 @@ class training:
             dt_swap: length of each swap payment period.
             n_p: number of swap payment periods. 
             dt_grid: temporal discretization step.
+            transformer: object containing the transformation matrices and the scaling tensors.
             lr: learning rate.
         """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -617,16 +777,17 @@ class training:
 
         # Early-stopping variables
         self.best_mare = float('inf')
-        self.loss_at_best_mare = float('inf')
         self.best_model_state = None
 
         # Initialize the training dataset and the DataLoader
-        self.train_dataset = PEMCDataset(Ntrain, intervals, T, self.device, batch_size, C, t0, dt_swap, n_p, dt_grid)
+        self.train_dataset = PEMCDataset(Ntrain, intervals, T, self.device, batch_size, C, t0, dt_swap, n_p, dt_grid, transformer)
         self.train_loader = DataLoader(self.train_dataset, batch_size=None)
+
+        self.transformer = transformer
 
     def validate(self, val_loader):
         """
-        Compute MSE and modified MARE on the validation dataset.
+        Computes MSE and modified MARE on the validation dataset.
         
         Arguments:
             val_loader: DataLoader for the validation set.
@@ -637,20 +798,17 @@ class training:
 
         # Compute the validation losses on the whole validation set
         with torch.no_grad():
-            for theta_val, sigma_val, f0_val, x_val, y_val in val_loader:
-                output = self.model(theta_val, sigma_val, f0_val, x_val)
-
-                # Normalize the payoff, divide by the notional amount
-                y_val_normalized = y_val / self.C
+            for input_val, y_val_descaled in val_loader:
+                output = self.model(input_val) * self.transformer.y_std + self.transformer.y_mean
                 
-                loss = self.criterion(output, y_val_normalized)
+                loss = self.criterion(output, y_val_descaled)
 
-                batch_size = theta_val.size(0)
+                batch_size = input_val.size(0)
                 total_loss += loss.item() * batch_size
                 total_samples += batch_size
 
                 sum_predictions += output.sum().item()
-                sum_targets += y_val_normalized.sum().item()
+                sum_targets += y_val_descaled.sum().item()
 
         # Compute the MSE loss to be used for hyperparameter tuning
         avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
@@ -675,29 +833,22 @@ class training:
             target_mare: under this value of modified MARE the training procedure stops, since model training is optimal.
         """
         patience_counter = 0
-        scaler = torch.amp.GradScaler('cuda')
 
-        # Training loop
         for epoch in tqdm(range(num_epochs)):
             self.model.train()
             running_loss, total_train_samples = 0, 0
 
-            for theta, sigma, f0, x, y in self.train_loader:
+            for input, y in self.train_loader:
 
                 # Create a batch of the dataset and train the model on it
                 self.optimizer.zero_grad()
 
-                # Normalize the payoff, divide by the notional amount
-                y_normalized = y / self.C
+                output = self.model(input)
+                loss = self.criterion(output, y)
+                loss.backward()
+                self.optimizer.step()
 
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    output = self.model(theta, sigma, f0, x)
-                    loss = self.criterion(output, y_normalized)
-                scaler.scale(loss).backward()
-                scaler.step(self.optimizer)
-                scaler.update()
-
-                current_bs = theta.size(0)
+                current_bs = input.size(0)
                 running_loss += loss.item() * current_bs
                 total_train_samples += current_bs
 
@@ -717,7 +868,6 @@ class training:
             # Case of improved modified MARE
             elif val_mare < self.best_mare:
                 self.best_mare = val_mare
-                self.loss_at_best_mare = val_loss
                 self.best_model_state = copy.deepcopy(self.model.state_dict())
                 patience_counter = 0
                 is_improvement = True
@@ -758,7 +908,7 @@ class evaluation:
             dt_grid: temporal discretization step.
         """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.ctx = HJMGridContext(0, T, dt_grid, t0, dt_swap, n_p, self.device)
+        self.ctx = HJMContext(0, T, dt_grid, t0, dt_swap, n_p, self.device)
         self.T, self.C, self.t0 = T, C, t0
         self.dt_swap, self.n_p, self.dt_grid = dt_swap, n_p, dt_grid
 
@@ -780,14 +930,12 @@ class evaluation:
 
                 # Accumulate the sum of payoffs for each batch
                 current_size = int(min(batch_size, n - i * batch_size))
-                batch_theta = theta_tensor[:current_size]
-                _, _, _, payoff = opt_hjm_payoff(self.ctx, batch_theta[:, 0], batch_theta[:, 1], batch_theta[:, 2],
-                                                 batch_theta[:, 3], batch_theta[:, 4],
-                                                 current_size, self.C, train=False, only_payoff=True)
+                batch_theta = theta_tensor[:current_size]    
+                payoff = opt_hjm_payoff(self.ctx, self.C, batch_theta[:, 0], batch_theta[:, 1], batch_theta[:, 2], batch_theta[:, 3], batch_theta[:, 4], current_size)
                 sum_payoffs += torch.sum(payoff)
         return (sum_payoffs / n).item()
 
-    def evaluate_PEMC(self, model, N, n, theta_tensor, batch_size):
+    def evaluate_PEMC(self, model, N, n, theta_tensor, batch_size, transformer, chunk_size=2048):
         """
         Computes the PEMC estimator.
 
@@ -797,6 +945,8 @@ class evaluation:
             n: sample size.
             theta_tensor: tensor that contains the evaluation parameters.
             batch_size: size of the batch used to compute the PEMC estimator.
+            transformer: object containing the transformation matrices and the scaling tensors.
+            chunk_size: dimension of each chunk that is simulated together and accumulated to form a batch.
         """    
         batches_per_epoch_n = n // batch_size + (n % batch_size > 0)
         batches_per_epoch_N = N // batch_size + (N % batch_size > 0)
@@ -805,26 +955,47 @@ class evaluation:
 
         with torch.no_grad():
 
-            # Generate n paired samples (label, features)        
+            # Generate n paired samples (label, features) divided in batches and chunks   
             for batch_idx in range(batches_per_epoch_n):
                 current_batch_size_n = min(batch_size, n - batch_idx * batch_size)
-                batch_theta_n = theta_tensor[:current_batch_size_n]
-                sigma_n, f0_n, x_n, f = opt_hjm_eval(self.ctx, batch_theta_n[:, 0], batch_theta_n[:, 1],
-                                                     batch_theta_n[:, 2], batch_theta_n[:, 3], batch_theta_n[:, 4],
-                                                     current_batch_size_n, self.C, train=False)
-                g = model(batch_theta_n, sigma_n, f0_n, x_n) * self.C
-                sum_diff += torch.sum(f - g)
-
-            # Generate N i.i.d. samples of X
+                batch_theta_n = theta_tensor[:current_batch_size_n]    
+                dW_full = torch.randn((current_batch_size_n, self.ctx.N_time, 1), device=self.device) * self.ctx.sqrt_dt
+                
+                for k in range(0, current_batch_size_n, chunk_size):
+                    mb_size = min(chunk_size, current_batch_size_n - k)
+                    mb_theta = batch_theta_n[k:k+mb_size]
+                    mb_dW = dW_full[k:k+mb_size]
+                
+                    sigma_n, f0_n, W_dt_n, f = opt_hjm(self.ctx, self.C, mb_theta[:, 0], mb_theta[:, 1], mb_theta[:, 2], mb_theta[:, 3], mb_theta[:, 4], mb_size, dW=mb_dW, train=False)
+                    transformed_input_n = transformer.transform(W_dt_n, sigma_n, f0_n)
+                    g = model(transformed_input_n) * transformer.y_std + transformer.y_mean
+                    sum_diff += torch.sum(f - g)
+                    
+                    del sigma_n, f0_n, f, W_dt_n, transformed_input_n, g
+                
+                del dW_full
+                torch.cuda.empty_cache()    
+            
+            # Generate N samples of W_dt, sigma and f0 divided in batches and chunks
             for batch_idx in range(batches_per_epoch_N):
                 current_batch_size_N = min(batch_size, N - batch_idx * batch_size)
                 batch_theta_N = theta_tensor[:current_batch_size_N]
-                sigma_N, f0_N, x_N, _ = opt_hjm_inputs(self.ctx, batch_theta_N[:, 0], batch_theta_N[:, 1],
-                                                       batch_theta_N[:, 2], batch_theta_N[:, 3],
-                                                       batch_theta_N[:, 4], current_batch_size_N, self.C, train=False,
-                                                       only_inputs=True)
-                g_tilda = model(batch_theta_N, sigma_N, f0_N, x_N) * self.C
-                sum_g_tilda += torch.sum(g_tilda)
+                dW_full = torch.randn((current_batch_size_N, self.ctx.N_time, 1), device=self.device) * self.ctx.sqrt_dt
+                
+                for k in range(0, current_batch_size_N, chunk_size):
+                    mb_size = min(chunk_size, current_batch_size_N - k)
+                    mb_theta = batch_theta_N[k:k+mb_size]
+                    mb_dW = dW_full[k:k+mb_size]
+                
+                    sigma_N, f0_N, W_dt_N = opt_hjm_inputs(self.ctx, self.C, mb_theta[:, 0], mb_theta[:, 1], mb_theta[:, 2], mb_theta[:, 3], mb_theta[:, 4], mb_size, dW=mb_dW, train=False)
+                    transformed_input_N = transformer.transform(W_dt_N, sigma_N, f0_N)
+                    g_tilda = model(transformed_input_N) * transformer.y_std + transformer.y_mean
+                    sum_g_tilda += torch.sum(g_tilda)
+                    
+                    del sigma_N, f0_N, W_dt_N, transformed_input_N, g_tilda
+                    
+                del dW_full
+                torch.cuda.empty_cache()
 
             # Compute PEMC estimator
             PEMC = sum_diff / n + sum_g_tilda / N
@@ -832,7 +1003,7 @@ class evaluation:
 
 
 # ----------------------------Optuna Optimization--------------------------------
-Ntrain = 3 * 10 ** 6
+Ntrain = 3 * 10 ** 4
 intervals = [(0.01, 0.03), (0.001, 0.9), (0.01, 0.03), (0.01, 0.05), (0.001, 0.9)] #(sigma0,alpha_sigma,f0,c_f,alpha_f)
 T = 25
 dt_grid = 1 / 52
@@ -841,20 +1012,18 @@ dt_swap = 1
 C = 100
 n_p = 20
 
-# Compile simulation functions
-hjm_train_fn = partial(simulate_hjm_swaption, train=True, only_inputs=False, only_payoff=False)
-opt_hjm_train = torch.compile(hjm_train_fn)
-hjm_eval_fn = partial(simulate_hjm_swaption, train=False, only_inputs=False, only_payoff=False)
-opt_hjm_eval = torch.compile(hjm_eval_fn)
+# Compile simulation function
+opt_hjm = torch.compile(simulate_hjm_swaption)
 hjm_inputs_fn = partial(simulate_hjm_swaption, train=False, only_inputs=True, only_payoff=False)
 opt_hjm_inputs = torch.compile(hjm_inputs_fn)
 hjm_payoff_fn = partial(simulate_hjm_swaption, train=False, only_inputs=False, only_payoff=True)
 opt_hjm_payoff = torch.compile(hjm_payoff_fn)
+opt_sigma_f0 = torch.compile(simulate_sigma_f0)
 
 # Optuna parameters
-epochs = 100
+epochs = 150
 patience = 15
-n_trials = 50
+n_trials = 100
 
 # Get device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -862,36 +1031,31 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 if torch.cuda.is_available():
     print(f"Running on: {torch.cuda.get_device_name(0)}")
 
+# Compute transformation matrices and the sacling tensors on a simulated dataset
+global_transformer = setup_global_pca(10000, intervals, T, device, C, t0, dt_swap, n_p, dt_grid)
+
+input_dim = global_transformer.n_components_
+print(f"Network input dims : {input_dim}")
+
 # Set the number of samples of the validation set
 val_dim = int(Ntrain * 0.1)
 
 def run_optuna_study():
 
     # Initialize the validation set for the hyperparameter tuning
-    hyperparameters_val_set = ValidationDataset(val_dim, intervals, T, device, C, t0, dt_swap, n_p, dt_grid)
+    hyperparameters_val_set = ValidationDataset(val_dim, intervals, T, device, C, t0, dt_swap, n_p, dt_grid, global_transformer)
     hyperparameters_loader = DataLoader(hyperparameters_val_set, batch_size=None)
 
     def objective(trial):
         model = None
         trainer = None
         try:
-            batch_size = trial.suggest_categorical('batch_size', [2048, 4096])
-            lr = trial.suggest_float('lr', 1e-4, 1e-3, log=True)
-            out_channels2d_1 = trial.suggest_categorical('out_channels2d_1', [32, 64, 128])
-            out_channels2d_2 = trial.suggest_categorical('out_channels2d_2', [64, 128, 256])
-            out_channels1d_1 = trial.suggest_categorical('out_channels1d_1', [32, 64, 128])
-            out_channels1d_2 = trial.suggest_categorical('out_channels1d_2', [64, 128, 256])
-            hidden_dim_synthesizer = trial.suggest_categorical('hidden_dim_synthesizer', [256, 512, 1024])
+            batch_size = trial.suggest_categorical('batch_size', [64, 128, 256, 512])
+            lr = trial.suggest_float('lr', 5e-5, 6e-4, log=True)
+            hidden_dim = trial.suggest_int('hidden_dim', 32, 128)
 
-            model = PEMCNetwork(
-                out_channels2d_1=out_channels2d_1,
-                out_channels2d_2=out_channels2d_2,
-                out_channels1d_1=out_channels1d_1,
-                out_channels1d_2=out_channels1d_2,
-                hidden_dim_synthesizer=hidden_dim_synthesizer
-            )
-
-            trainer = training(model, Ntrain, batch_size, intervals, T, C, t0, dt_swap, n_p, dt_grid, lr=lr)
+            model = PEMCNetwork(input_dim, hidden_dim)
+            trainer = training(model, Ntrain, batch_size, intervals, T, C, t0, dt_swap, n_p, dt_grid, lr=lr, transformer=global_transformer)
             trainer.fit(num_epochs=epochs, patience=patience, val_loader=early_stopping_loader)
 
             # Compute the MSE loss on the validation set for the hyperparameter tuning
@@ -927,13 +1091,7 @@ if load_model:
     best_params = load_best_params(PARAMS_FILE)
 
     # Create the model architecture
-    model = PEMCNetwork(
-        out_channels2d_1=best_params['out_channels2d_1'],
-        out_channels2d_2=best_params['out_channels2d_2'],
-        out_channels1d_1=best_params['out_channels1d_1'],
-        out_channels1d_2=best_params['out_channels1d_2'],
-        hidden_dim_synthesizer=best_params['hidden_dim_synthesizer']
-    )
+    model = PEMCNetwork(input_dim, hidden_dim=best_params['hidden_dim'])
     model = model.to(device).float()
 
     # Upload weights and biases
@@ -949,7 +1107,7 @@ if load_model:
 # Train the model
 else:
     # Initialize the validation set for early-stopping
-    early_stopping_val_set = ValidationDataset(val_dim, intervals, T, device, C, t0, dt_swap, n_p, dt_grid)
+    early_stopping_val_set = ValidationDataset(val_dim, intervals, T, device, C, t0, dt_swap, n_p, dt_grid, global_transformer)
     early_stopping_loader = DataLoader(early_stopping_val_set, batch_size=None)
 
     # Load the best hyperparameters and just do the final retraining
@@ -965,15 +1123,9 @@ else:
 
     # Retrain with best hyperparameters
     print("Retraining with best hyperparameters...")
-    model = PEMCNetwork(
-        out_channels2d_1=best_params['out_channels2d_1'],
-        out_channels2d_2=best_params['out_channels2d_2'],
-        out_channels1d_1=best_params['out_channels1d_1'],
-        out_channels1d_2=best_params['out_channels1d_2'],
-        hidden_dim_synthesizer=best_params['hidden_dim_synthesizer']
-    )
+    model = PEMCNetwork(input_dim, hidden_dim=best_params['hidden_dim'])
     trainer = training(model, Ntrain, best_params['batch_size'], intervals, T, C, t0, dt_swap, n_p, dt_grid,
-                       lr=best_params['lr'])
+                       lr=best_params['lr'], transformer=global_transformer)
     trainer.fit(num_epochs=epochs, patience=patience, val_loader=early_stopping_loader)
 
     print(f"Saving trained model to {MODEL_FILE}...")
@@ -990,6 +1142,7 @@ else:
 # Delete datasets to free memory
 if 'hyperparameters_val_set' in globals(): del hyperparameters_val_set
 if 'hyperparameters_loader' in globals(): del hyperparameters_loader
+if 'study' in globals(): del study
 gc.collect()
 torch.cuda.empty_cache()
 
@@ -1034,7 +1187,6 @@ rmsePEMC = np.zeros(len(n_values))
 for i, n in enumerate(n_values):
     print(f"Evaluation with n={n}")
 
-    # Reset error accumulators for each n
     errMC = 0
     errPEMC = 0
 
@@ -1042,7 +1194,7 @@ for i, n in enumerate(n_values):
         current_seed = 42 + (i * 10000) + j
         set_all_seeds(current_seed)
         MC = evaluator.evaluate_MC(n, theta_tensor, batch_eval)
-        PEMC = evaluator.evaluate_PEMC(model, 10 * n, n, theta_tensor, batch_eval)
+        PEMC = evaluator.evaluate_PEMC(model, 10 * n, n, theta_tensor, batch_eval, global_transformer)
 
         errMC += (MC - ground_truth) ** 2
         errPEMC += (PEMC - ground_truth) ** 2

@@ -46,7 +46,7 @@ def set_all_seeds(seed=42):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     os.environ['PYTHONHASHSEED'] = str(seed)
-    
+
 # Set seeds
 set_all_seeds(42)
 
@@ -832,7 +832,7 @@ class evaluation:
 
 
 # ----------------------------Optuna Optimization--------------------------------
-Ntrain = 3 * 10 ** 6
+Ntrain = 3 * 10 ** 4
 intervals = [(0.01, 0.03), (0.001, 0.9), (0.01, 0.03), (0.01, 0.05), (0.001, 0.9)] #(sigma0,alpha_sigma,f0,c_f,alpha_f)
 T = 25
 dt_grid = 1 / 52
@@ -854,7 +854,7 @@ opt_hjm_payoff = torch.compile(hjm_payoff_fn)
 # Optuna parameters
 epochs = 100
 patience = 15
-n_trials = 50
+n_trials = 100
 
 # Get device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -875,13 +875,13 @@ def run_optuna_study():
         model = None
         trainer = None
         try:
-            batch_size = trial.suggest_categorical('batch_size', [2048, 4096])
+            batch_size = trial.suggest_categorical('batch_size', [64, 128, 256, 512])
             lr = trial.suggest_float('lr', 1e-4, 1e-3, log=True)
-            out_channels2d_1 = trial.suggest_categorical('out_channels2d_1', [32, 64, 128])
-            out_channels2d_2 = trial.suggest_categorical('out_channels2d_2', [64, 128, 256])
-            out_channels1d_1 = trial.suggest_categorical('out_channels1d_1', [32, 64, 128])
-            out_channels1d_2 = trial.suggest_categorical('out_channels1d_2', [64, 128, 256])
-            hidden_dim_synthesizer = trial.suggest_categorical('hidden_dim_synthesizer', [256, 512, 1024])
+            out_channels2d_1 = trial.suggest_categorical('out_channels2d_1', [4, 8, 16, 32])
+            out_channels2d_2 = trial.suggest_categorical('out_channels2d_2', [16, 32, 64])
+            out_channels1d_1 = trial.suggest_categorical('out_channels1d_1', [4, 8, 16, 32])
+            out_channels1d_2 = trial.suggest_categorical('out_channels1d_2', [16, 32, 64])
+            hidden_dim_synthesizer = trial.suggest_categorical('hidden_dim_synthesizer', [128, 256, 512])
 
             model = PEMCNetwork(
                 out_channels2d_1=out_channels2d_1,

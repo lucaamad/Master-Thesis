@@ -1,0 +1,6 @@
+{
+    "dim_X_5": {
+        "batch_size": 256,
+        "combined_hidden": 193
+    }
+}
