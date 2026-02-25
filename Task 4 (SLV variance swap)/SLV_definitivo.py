@@ -24,7 +24,7 @@ use_saved_params = True  # Set to True to load saved parameters instead of runni
 load_model = True  # Set to True to load directly the retrained model instead of running the retraining
 
 # GROUND TRUTH COMPUTATION
-compute_ground_truth = False  # Set to True to load saved ground truth value instead of computing it
+compute_ground_truth = False  # Set to False to load saved ground truth value instead of computing it
 
 torch.set_default_dtype(torch.float32)
 
@@ -45,10 +45,6 @@ def set_all_seeds(seed=42):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     os.environ['PYTHONHASHSEED'] = str(seed)
-    print(f"✓ All seeds set to {seed}")
-    if torch.cuda.is_available():
-        print(f"✓ Running on: {torch.cuda.get_device_name(0)}")
-
 
 # Set seeds
 set_all_seeds(42)
@@ -519,7 +515,6 @@ class training:
 
         # Early-stopping variables
         self.best_mare = float('inf')
-        self.loss_at_best_mare = float('inf')
         self.best_model_state = None
 
         # Initialize the training dataset and the DataLoader
@@ -613,7 +608,6 @@ class training:
             # Case of improved modified MARE
             elif val_mare < self.best_mare:
                 self.best_mare = val_mare
-                self.loss_at_best_mare = val_loss
                 self.best_model_state = copy.deepcopy(self.model.state_dict())
                 patience_counter = 0
                 is_improvement = True
@@ -747,6 +741,9 @@ n_trials = 50
 
 # Get device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+if torch.cuda.is_available():
+    print(f"Running on: {torch.cuda.get_device_name(0)}")
 
 # Set the number of samples of the validation set
 val_dim = int(Ntrain * 0.1)
